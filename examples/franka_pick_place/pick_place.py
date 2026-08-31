@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import isaacsim.core.experimental.utils.stage as stage_utils
 import numpy as np
@@ -31,16 +31,30 @@ class FrankaPickPlace:
     Just straightforward robot control that's easy to understand and modify.
     """
 
-    def __init__(self, events_dt: Optional[List[float]] = None):
+    def __init__(
+        self,
+        events_dt: Optional[List[float]] = None,
+        randomize_cube_position: bool = True,
+        cube_position_bounds: Optional[Tuple[float, float, float, float]] = None,
+        random_seed: Optional[int] = None,
+    ):
         """Initialize the FrankaPickPlace controller.
 
         Sets up initial state variables for the state machine.
 
         Args:
             events_dt: List of step counts for each phase. If None, uses default values.
+            randomize_cube_position: Randomize the cube on setup and on each reset.
+            cube_position_bounds: Optional ``(x_min, x_max, y_min, y_max)`` workspace bounds in meters.
+            random_seed: Optional seed for reproducible random positions.
         """
         self.cube = None
         self.robot = None
+        self.randomize_cube_position = randomize_cube_position
+        # These bounds keep the cube in the Panda's conservative tabletop
+        # workspace. The tuple is (x_min, x_max, y_min, y_max), in meters.
+        self.cube_position_bounds = cube_position_bounds or (0.40, 0.60, -0.20, 0.20)
+        self._random = np.random.default_rng(random_seed)
 
         # Define step counts for each phase
         self.events_dt = events_dt
@@ -72,7 +86,7 @@ class FrankaPickPlace:
         Sets default values for positions and sizes if not provided.
 
         Args:
-            cube_initial_position: Initial cube position [x, y, z]. Defaults to [0.5, 0.0, 0.0258].
+            cube_initial_position: Initial cube position [x, y, z]. If omitted, a random reachable position is used.
             cube_initial_orientation: Initial cube orientation as quaternion [w, x, y, z]. Defaults to [1, 0, 0, 0].
             cube_size: Cube dimensions [w, h, d]. Defaults to [0.0515, 0.0515, 0.0515].
             target_position: Target position for placing [x, y, z]. Defaults to [-0.3, -0.3, cube_height/2].
@@ -95,6 +109,9 @@ class FrankaPickPlace:
         if self.offset is None:
             self.offset = np.array([0.0, 0.0, 0.0])
         self.target_position = self.target_position + self.offset
+
+        if self.randomize_cube_position and cube_initial_position is None:
+            self.cube_initial_position = self.sample_cube_position()
 
         # Create a new USD stage with default sunlight lighting
         stage_utils.create_new_stage(template="sunlight")
@@ -125,6 +142,16 @@ class FrankaPickPlace:
         GeomPrim(paths=cube_shape.paths, apply_collision_apis=True)
         self.cube = RigidPrim(paths=cube_shape.paths)
         cube_shape.apply_visual_materials(visual_material)
+
+    def sample_cube_position(self) -> np.ndarray:
+        """Return a random tabletop position inside the configured workspace."""
+        x_min, x_max, y_min, y_max = self.cube_position_bounds
+        x = self._random.uniform(x_min, x_max)
+        y = self._random.uniform(y_min, y_max)
+        # The cube is 5.15 cm tall by default, so place its center on the
+        # tabletop instead of letting the first physics step drop it.
+        z = float(self.cube_size[2]) / 2.0
+        return np.array([x, y, z])
 
     def forward(self, ik_method: str = "damped-least-squares") -> bool:
         """Execute one step of the pick-and-place operation using the specified IK method.
@@ -270,7 +297,7 @@ class FrankaPickPlace:
         Use this for complete system reset.
 
         Args:
-            cube_position: Optional new position for the cube. If None, uses initial position.
+            cube_position: Optional new position for the cube. If None, randomization settings are used.
             cube_orientation: Optional new orientation for the cube. If None, uses initial orientation.
         """
         print("Resetting pick-and-place system...")
@@ -300,17 +327,25 @@ class FrankaPickPlace:
         """Reset the cube to its initial position and orientation.
 
         Args:
-            position: Optional new position for the cube. If None, uses initial position.
+            position: Optional new position for the cube. If None, randomization settings are used.
             orientation: Optional new orientation for the cube. If None, uses initial orientation.
         """
         if self.cube is not None:
             # Use provided position/orientation or fall back to initial values
-            reset_position = position if position is not None else self.cube_initial_position
+            if position is not None:
+                reset_position = position
+            elif self.randomize_cube_position:
+                reset_position = self.sample_cube_position()
+            else:
+                reset_position = self.cube_initial_position
             reset_orientation = orientation if orientation is not None else self.cube_initial_orientation
 
             # Reset cube position and orientation
             self.cube.set_world_poses(
                 positions=reset_position.reshape(1, -1), orientations=reset_orientation.reshape(1, -1)
+            )
+            self.cube.set_velocities(
+                linear_velocities=np.zeros((1, 3)), angular_velocities=np.zeros((1, 3))
             )
 
             print(f"Cube reset to position: {reset_position}")

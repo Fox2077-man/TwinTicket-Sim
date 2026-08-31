@@ -22,6 +22,13 @@ parser.add_argument("--headless", action="store_true", help="Run without a visib
 parser.add_argument("--webrtc", action="store_true", help="Enable Isaac Sim WebRTC livestreaming")
 parser.add_argument("--test", action="store_true", help="Exit after one completed pick-and-place sequence")
 parser.add_argument(
+    "--auto-start",
+    action="store_true",
+    help="Start immediately instead of waiting for the Start/Pause UI button",
+)
+parser.add_argument("--fixed-cube", action="store_true", help="Keep the cube at its default fixed position")
+parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducible cube positions")
+parser.add_argument(
     "--repeat",
     type=int,
     default=1,
@@ -59,17 +66,82 @@ import omni.timeline
 from isaacsim.core.simulation_manager import SimulationManager
 from examples.franka_pick_place.pick_place import FrankaPickPlace
 
+execution_control = None
+
+
+class ExecutionControl:
+    """Small Isaac Sim UI window for starting and pausing the state machine."""
+
+    def __init__(self, timeline, initially_running: bool, show_ui: bool):
+        self.timeline = timeline
+        self.running = initially_running
+        self.window = None
+        self.status_label = None
+        self.toggle_button = None
+
+        if not show_ui:
+            return
+
+        try:
+            import omni.ui as ui
+
+            self.window = ui.Window("Franka Pick and Place", width=300, height=120)
+            with self.window.frame:
+                with ui.VStack(spacing=8, height=0):
+                    ui.Label("Execution control", height=24)
+                    self.status_label = ui.Label("")
+                    self.toggle_button = ui.Button("", height=34, clicked_fn=self.toggle)
+            self._update_widgets()
+        except Exception as exc:
+            # A headless/minimal Kit build may not have omni.ui available.
+            # Keep the simulation usable by falling back to automatic start.
+            print(f"UI controls unavailable ({exc}); starting automatically")
+            self.running = True
+
+    def _update_widgets(self):
+        if self.status_label is None or self.toggle_button is None:
+            return
+        if self.running:
+            self.status_label.text = "Status: Running"
+            self.toggle_button.text = "Pause Pick/Place"
+        else:
+            self.status_label.text = "Status: Paused"
+            self.toggle_button.text = "Start Pick/Place"
+
+    def toggle(self):
+        self.running = not self.running
+        if self.running:
+            self.timeline.play()
+            print("Pick-and-place execution resumed")
+        else:
+            self.timeline.pause()
+            print("Pick-and-place execution paused")
+        self._update_widgets()
+
+    def close(self):
+        if self.window is not None:
+            self.window.visible = False
+            self.window = None
+
 
 def main():
+    global execution_control
+
     print("Starting Simple Franka Pick-and-Place Demo")
     SimulationManager.set_physics_sim_device(args.device)
     simulation_app.update()
 
-    pick_place = FrankaPickPlace()
+    pick_place = FrankaPickPlace(randomize_cube_position=not args.fixed_cube, random_seed=args.seed)
     pick_place.setup_scene()
 
-    # Play the simulation.
-    omni.timeline.get_timeline_interface().play()
+    timeline = omni.timeline.get_timeline_interface()
+    show_controls = args.webrtc or not args.headless
+    initially_running = args.auto_start or args.test or not show_controls
+    execution_control = ExecutionControl(timeline, initially_running, show_controls)
+    if execution_control.running:
+        timeline.play()
+    else:
+        timeline.pause()
     simulation_app.update()
 
     reset_needed = True
@@ -77,9 +149,14 @@ def main():
 
     print("Starting pick-and-place execution")
     while simulation_app.is_running():
-        if SimulationManager.is_simulating():
+        if execution_control.running and SimulationManager.is_simulating():
             if reset_needed:
-                pick_place.reset()
+                # Keep the position shown while waiting for the first click;
+                # later repeated runs receive a new random position.
+                if completed_runs == 0:
+                    pick_place.reset(cube_position=pick_place.cube_initial_position)
+                else:
+                    pick_place.reset()
                 reset_needed = False
                 run_number = completed_runs + 1
                 if args.repeat == 0:
@@ -109,4 +186,6 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Error: {e}")
     finally:
+        if execution_control is not None:
+            execution_control.close()
         simulation_app.close()
