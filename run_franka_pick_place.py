@@ -19,7 +19,15 @@ import argparse
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--headless", action="store_true", help="Run without a visible Isaac Sim window")
+parser.add_argument("--webrtc", action="store_true", help="Enable Isaac Sim WebRTC livestreaming")
 parser.add_argument("--test", action="store_true", help="Exit after one completed pick-and-place sequence")
+parser.add_argument(
+    "--repeat",
+    type=int,
+    default=1,
+    metavar="N",
+    help="Number of pick-and-place runs; use 0 for infinite repetition (default: 1)",
+)
 parser.add_argument("--device", type=str, choices=["cpu", "cuda"], default="cpu", help="Simulation device")
 parser.add_argument(
     "--ik-method",
@@ -29,10 +37,23 @@ parser.add_argument(
     help="Differential inverse kinematics method",
 )
 args, _ = parser.parse_known_args()
+if args.repeat < 0:
+    parser.error("--repeat must be 0 or a positive integer")
 
 from isaacsim import SimulationApp
 
-simulation_app = SimulationApp({"headless": args.headless})
+simulation_config = {"headless": args.headless or args.webrtc}
+if args.webrtc:
+    # WebRTC needs a headless renderer while keeping the streamed UI visible.
+    simulation_config["hide_ui"] = False
+
+simulation_app = SimulationApp(simulation_config)
+
+if args.webrtc:
+    from isaacsim.core.utils.extensions import enable_extension
+
+    enable_extension("omni.services.livestream.nvcf")
+    simulation_app.update()
 
 import omni.timeline
 from isaacsim.core.simulation_manager import SimulationManager
@@ -52,23 +73,32 @@ def main():
     simulation_app.update()
 
     reset_needed = True
-    task_completed = False
+    completed_runs = 0
 
     print("Starting pick-and-place execution")
     while simulation_app.is_running():
-        if SimulationManager.is_simulating() and not task_completed:
+        if SimulationManager.is_simulating():
             if reset_needed:
                 pick_place.reset()
                 reset_needed = False
+                run_number = completed_runs + 1
+                if args.repeat == 0:
+                    print(f"Starting pick-and-place run {run_number} (infinite mode)")
+                else:
+                    print(f"Starting pick-and-place run {run_number}/{args.repeat}")
 
             # Execute one step of the pick-and-place operation
             pick_place.forward(args.ik_method)
 
-        if pick_place.is_done() and not task_completed:
-            print("Done picking and placing")
-            task_completed = True
-            if args.test:
-                break
+            if pick_place.is_done():
+                completed_runs += 1
+                print(f"Done picking and placing (run {completed_runs})")
+
+                # --test always stops after one run; otherwise --repeat controls
+                # whether another reset-and-run cycle should start.
+                if args.test or (args.repeat > 0 and completed_runs >= args.repeat):
+                    break
+                reset_needed = True
 
         simulation_app.update()
 
