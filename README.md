@@ -26,11 +26,8 @@ python run_franka_pick_place.py --headless --auto-start --repeat 0
 between runs. `--repeat 0` repeats indefinitely. The default is one run, and
 `--test` always exits after the first completed run.
 
-By default, the cube starts at a random reachable tabletop position and receives
-a new random position between repeated runs. The conservative sampling area is
-`x = 0.40..0.60 m` and `y = -0.20..0.20 m` relative to the robot base. Use
-`--fixed-cube` to restore the original position, or `--seed N` to reproduce the
-same random sequence.
+The cube always starts at and returns to its fixed default tabletop position
+`[0.5, 0.0, 0.0258]` (meters), including between repeated runs.
 
 Visible and WebRTC sessions open a **Franka Pick and Place** window. Click
 **Start Pick/Place** to begin and **Pause Pick/Place** to freeze the simulation;

@@ -26,8 +26,6 @@ parser.add_argument(
     action="store_true",
     help="Start immediately instead of waiting for the Start/Pause UI button",
 )
-parser.add_argument("--fixed-cube", action="store_true", help="Keep the cube at its default fixed position")
-parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducible cube positions")
 parser.add_argument(
     "--repeat",
     type=int,
@@ -131,7 +129,7 @@ def main():
     SimulationManager.set_physics_sim_device(args.device)
     simulation_app.update()
 
-    pick_place = FrankaPickPlace(randomize_cube_position=not args.fixed_cube, random_seed=args.seed)
+    pick_place = FrankaPickPlace()
     pick_place.setup_scene()
 
     timeline = omni.timeline.get_timeline_interface()
@@ -151,12 +149,7 @@ def main():
     while simulation_app.is_running():
         if execution_control.running and SimulationManager.is_simulating():
             if reset_needed:
-                # Keep the position shown while waiting for the first click;
-                # later repeated runs receive a new random position.
-                if completed_runs == 0:
-                    pick_place.reset(cube_position=pick_place.cube_initial_position)
-                else:
-                    pick_place.reset()
+                pick_place.reset()
                 reset_needed = False
                 run_number = completed_runs + 1
                 if args.repeat == 0:
