@@ -20,13 +20,15 @@ python run_franka_pick_place.py --device cuda --ik-method pseudoinverse
 python run_franka_pick_place.py --repeat 5
 python run_franka_pick_place.py --webrtc --repeat 0
 python run_franka_pick_place.py --headless --auto-start --repeat 0
+python run_franka_pick_place.py --headless --auto-start --repeat 5 \
+  --device cpu --seed 0 --results-dir artifacts/baseline
 ```
 
 `--repeat N` runs the complete sequence `N` times and resets the robot and cube
 between runs. `--repeat 0` repeats indefinitely. The default is one run, and
 `--test` always exits after the first completed run.
 
-The cube always starts at and returns to its fixed default tabletop position
+Each run resets the cube to its fixed default tabletop position
 `[0.5, 0.0, 0.0258]` (meters), including between repeated runs.
 
 Visible and WebRTC sessions open a **Franka Pick and Place** window. Click
@@ -72,6 +74,56 @@ allow TCP `49100` plus UDP `47998` in the firewall or cloud security group.
 The scene creates a Franka Panda arm, a blue cube, a ground environment, and a
 seven-phase state machine: move above the cube, approach, grasp, lift, move to
 the target, release, and retract.
+
+## Repeatable baseline experiments
+
+The runner fixes the cube reset pose, robot default pose, phase targets, and
+random seeds. `--reset-settle-steps` holds the reset pose before motion and
+`--post-run-settle-steps` lets the released cube settle before success is
+evaluated. The default values are 15 and 30 frames respectively. Keep these
+values, the IK method, and the simulation device unchanged when comparing a
+fault-injected run with a normal baseline.
+
+Each invocation creates a timestamped directory below `--results-dir`:
+
+```text
+session-YYYYMMDD-HHMMSS/
+  experiment.log       # line-buffered lifecycle and phase log
+  kit.log              # Isaac Sim Kit log copied before shutdown
+  summary.json         # configuration and all run results
+  run-001/
+    result.json        # success, timings, metrics, phase history
+    trace.jsonl         # per-step cube/EE/DOF observations
+  run-001.mp4          # when --record-video is enabled
+```
+
+Use `--record-video` with `--webrtc` to save one 1280x720 MP4 for every run:
+
+```bash
+python run_franka_pick_place.py --webrtc --record-video --auto-start \
+  --repeat 3 --device cpu --seed 0 --results-dir artifacts/video-baseline
+```
+
+Video capture also leaves the numbered PNG frames beside each MP4. Recording
+is slower because every frame is rendered and encoded; compare simulation
+steps and physical metrics in `result.json` rather than wall-clock time alone.
+
+Success requires all of the following: the seven-phase state machine completed,
+the cube rose by at least 0.05 m, the final XY position is within 0.08 m of the
+target, and the final cube height is within 0.06 m of the tabletop. This avoids
+counting a motion sequence that merely reached its last phase as a physical
+pick-and-place success.
+
+When running in the NVIDIA Docker image, the container uses UID 1234. Make the
+results directory writable before a host-mounted run if necessary:
+
+```bash
+sudo mkdir -p artifacts
+sudo chmod -R a+rwX artifacts
+```
+
+Do not commit generated experiment data; the repository ignores `artifacts/*`
+while retaining `artifacts/.gitkeep`.
 
 The official source is available at:
 <https://github.com/isaac-sim/IsaacSim/tree/v5.1.0/source/standalone_examples/api/isaacsim.robot.manipulators/franka>

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import isaacsim.core.experimental.utils.stage as stage_utils
 import numpy as np
@@ -31,16 +31,35 @@ class FrankaPickPlace:
     Just straightforward robot control that's easy to understand and modify.
     """
 
-    def __init__(self, events_dt: Optional[List[float]] = None):
+    def __init__(
+        self,
+        events_dt: Optional[List[float]] = None,
+        reset_settle_steps: int = 15,
+        log_callback: Optional[Callable[[str], None]] = None,
+    ):
         """Initialize the FrankaPickPlace controller.
 
         Sets up initial state variables for the state machine.
 
         Args:
             events_dt: List of step counts for each phase. If None, uses default values.
+            reset_settle_steps: Number of simulation steps to hold the reset state before moving.
+            log_callback: Optional callback for experiment logging.
         """
         self.cube = None
         self.robot = None
+        self.reset_settle_steps = max(0, int(reset_settle_steps))
+        self._log_callback = log_callback
+        self._run_start_cube_position = None
+        self._lift_target = None
+        self._retract_target = None
+        self._reset_settle_steps_remaining = 0
+        self._run_step_count = 0
+        self._trace: List[Dict[str, Any]] = []
+        self._phase_history: List[Dict[str, Any]] = []
+        self._max_cube_height = float("-inf")
+        self._min_cube_ee_distance_during_lift = float("inf")
+        self._last_observation = None
 
         # Define step counts for each phase
         self.events_dt = events_dt
@@ -57,6 +76,68 @@ class FrankaPickPlace:
             ]
         self._event = 0
         self._step = 0
+
+    def _emit(self, message: str) -> None:
+        """Emit a human-readable event to stdout and the experiment logger."""
+        if self._log_callback is not None:
+            self._log_callback(message)
+        else:
+            print(message, flush=True)
+
+    @staticmethod
+    def _as_list(value: Any) -> Optional[List[float]]:
+        if value is None:
+            return None
+        return np.asarray(value, dtype=float).reshape(-1).tolist()
+
+    def _observe(self, label: str = "step") -> Dict[str, Any]:
+        """Record state useful for separating motion, contact, and placement errors."""
+        if self.cube is None or self.robot is None:
+            return {"label": label, "event": self._event, "step": self._step}
+
+        cube_positions, cube_orientations = self.cube.get_world_poses()
+        cube_position = cube_positions.numpy()[0]
+        cube_orientation = cube_orientations.numpy()[0]
+        _, ee_positions, ee_orientations = self.robot.get_current_state()
+        ee_position = ee_positions[0]
+        ee_orientation = ee_orientations[0]
+        dof_positions = self.robot.get_dof_positions().numpy()[0]
+
+        cube_ee_distance = float(np.linalg.norm(cube_position - ee_position))
+        self._max_cube_height = max(self._max_cube_height, float(cube_position[2]))
+        if self._event >= 3:
+            self._min_cube_ee_distance_during_lift = min(
+                self._min_cube_ee_distance_during_lift, cube_ee_distance
+            )
+
+        observation = {
+            "label": label,
+            "run_step": self._run_step_count,
+            "event": self._event,
+            "phase": self.phase_name,
+            "phase_step": self._step,
+            "cube_position": cube_position.tolist(),
+            "cube_orientation": cube_orientation.tolist(),
+            "end_effector_position": ee_position.tolist(),
+            "end_effector_orientation": ee_orientation.tolist(),
+            "dof_positions": dof_positions.tolist(),
+            "cube_ee_distance": cube_ee_distance,
+        }
+        self._trace.append(observation)
+        self._last_observation = observation
+        return observation
+
+    @property
+    def phase_name(self) -> str:
+        return (
+            "move_above_cube",
+            "approach_cube",
+            "close_gripper",
+            "lift_cube",
+            "move_to_target",
+            "release_cube",
+            "retract",
+        )[min(self._event, 6)]
 
     def setup_scene(
         self,
@@ -138,17 +219,36 @@ class FrankaPickPlace:
         if self.is_done():
             return False
 
+        # Hold the reset pose for a few frames so every run starts after the
+        # same articulation/cube state has been accepted by the simulator.
+        if self._reset_settle_steps_remaining > 0:
+            self.robot.reset_to_default_pose()
+            self._run_step_count += 1
+            self._observe(label="reset_settle")
+            self._reset_settle_steps_remaining -= 1
+            return True
+
+        self._run_step_count += 1
+        self._observe(label="before_action")
+
         # Get downward-facing orientation for end-effector
         goal_orientation = self.robot.get_downward_orientation()
 
         # Phase 0: Move to x,y position above cube
         if self._event == 0:
             if self._step == 0:
-                print("Phase 0: Moving to x,y position above cube...")
+                self._emit("Phase 0: Moving to x,y position above cube...")
+                self._phase_history.append(
+                    {
+                        "event": self._event,
+                        "phase": self.phase_name,
+                        "run_step": self._run_step_count,
+                    }
+                )
 
-            # Goal is above the cube at a safe height, matching x,y position
-            cube_pos = self.cube.get_world_poses()[0].numpy()
-            goal_position = np.array([cube_pos[0, 0], cube_pos[0, 1], cube_pos[0, 2] + 0.2])  # Higher above cube
+            # Use the reset position rather than a live physics pose so that
+            # tiny settling differences cannot change the commanded path.
+            goal_position = self._run_start_cube_position + np.array([0.0, 0.0, 0.2])
 
             # Use the new high-level method that combines position and orientation
             self.robot.set_end_effector_pose(position=goal_position, orientation=goal_orientation, ik_method=ik_method)
@@ -161,11 +261,17 @@ class FrankaPickPlace:
         # Phase 1: Approach down to the cube
         elif self._event == 1:
             if self._step == 0:
-                print("Phase 1: Approaching cube...")
+                self._emit("Phase 1: Approaching cube...")
+                self._phase_history.append(
+                    {
+                        "event": self._event,
+                        "phase": self.phase_name,
+                        "run_step": self._run_step_count,
+                    }
+                )
 
-            # Goal is above and slightly behind the cube for proper approach
-            cube_pos = self.cube.get_world_poses()[0].numpy()
-            goal_position = cube_pos + np.array([0.0, 0.0, 0.1])  # Approach from above with safe distance
+            # Approach the fixed cube pose at a repeatable height.
+            goal_position = self._run_start_cube_position + np.array([0.0, 0.0, 0.1])
 
             # Move to position using the controller
             self.robot.set_end_effector_pose(position=goal_position, orientation=goal_orientation, ik_method=ik_method)
@@ -178,7 +284,14 @@ class FrankaPickPlace:
         # Phase 2: Close gripper to grasp the cube
         elif self._event == 2:
             if self._step == 0:
-                print("Phase 2: Closing gripper...")
+                self._emit("Phase 2: Closing gripper...")
+                self._phase_history.append(
+                    {
+                        "event": self._event,
+                        "phase": self.phase_name,
+                        "run_step": self._run_step_count,
+                    }
+                )
 
             # Close gripper
             self.robot.close_gripper()
@@ -191,11 +304,19 @@ class FrankaPickPlace:
         # Phase 3: Lift the cube
         elif self._event == 3:
             if self._step == 0:
-                print("Phase 3: Lifting cube...")
+                self._emit("Phase 3: Lifting cube...")
+                self._phase_history.append(
+                    {
+                        "event": self._event,
+                        "phase": self.phase_name,
+                        "run_step": self._run_step_count,
+                    }
+                )
 
-            # Get current end effector position and lift up
-            _, current_position, _ = self.robot.get_current_state()
-            goal_position = current_position + np.array([0.0, 0.0, 0.2])
+            # Keep one fixed lift target. The previous implementation added
+            # 0.2 m to the *current* pose every frame, which made the target
+            # drift upward and made contact outcomes harder to compare.
+            goal_position = self._lift_target
 
             # Move to position using the controller
             self.robot.set_end_effector_pose(position=goal_position, orientation=goal_orientation, ik_method=ik_method)
@@ -208,7 +329,14 @@ class FrankaPickPlace:
         # Phase 4: Move cube to target location
         elif self._event == 4:
             if self._step == 0:
-                print("Phase 4: Moving cube...")
+                self._emit("Phase 4: Moving cube...")
+                self._phase_history.append(
+                    {
+                        "event": self._event,
+                        "phase": self.phase_name,
+                        "run_step": self._run_step_count,
+                    }
+                )
 
             # Move to position using the controller
             self.robot.set_end_effector_pose(
@@ -223,7 +351,14 @@ class FrankaPickPlace:
         # Phase 5: Open gripper to release cube
         elif self._event == 5:
             if self._step == 0:
-                print("Phase 5: Opening gripper...")
+                self._emit("Phase 5: Opening gripper...")
+                self._phase_history.append(
+                    {
+                        "event": self._event,
+                        "phase": self.phase_name,
+                        "run_step": self._run_step_count,
+                    }
+                )
 
             # Open gripper
             self.robot.open_gripper()
@@ -236,11 +371,17 @@ class FrankaPickPlace:
         # Phase 6: Move up
         elif self._event == 6:
             if self._step == 0:
-                print("Phase 6: Moving up...")
+                self._emit("Phase 6: Moving up...")
+                self._phase_history.append(
+                    {
+                        "event": self._event,
+                        "phase": self.phase_name,
+                        "run_step": self._run_step_count,
+                    }
+                )
 
-            # Goal is to lift up
-            cube_pos = self.cube.get_world_poses()[0].numpy()
-            goal_position = cube_pos + np.array([0.0, 0.0, 0.3])  # Move above the cube
+            # Retract from the fixed target rather than from a live cube pose.
+            goal_position = self._retract_target
 
             # Move to position using the controller
             self.robot.set_end_effector_pose(position=goal_position, orientation=goal_orientation, ik_method=ik_method)
@@ -273,10 +414,21 @@ class FrankaPickPlace:
             cube_position: Optional new position for the cube. If None, uses initial position.
             cube_orientation: Optional new orientation for the cube. If None, uses initial orientation.
         """
-        print("Resetting pick-and-place system...")
+        self._emit("Resetting pick-and-place system...")
         self.reset_robot()
         self.reset_cube(position=cube_position, orientation=cube_orientation)
-        print("Pick-and-place system reset complete")
+        reset_position = cube_position if cube_position is not None else self.cube_initial_position
+        self._run_start_cube_position = np.asarray(reset_position, dtype=float).reshape(3).copy()
+        self._lift_target = self._run_start_cube_position + np.array([0.0, 0.0, 0.3])
+        self._retract_target = self.target_position + np.array([0.0, 0.0, 0.3])
+        self._reset_settle_steps_remaining = self.reset_settle_steps
+        self._run_step_count = 0
+        self._trace = []
+        self._phase_history = []
+        self._max_cube_height = float(self._run_start_cube_position[2])
+        self._min_cube_ee_distance_during_lift = float("inf")
+        self._last_observation = None
+        self._emit("Pick-and-place system reset complete")
 
     def reset_robot(self):
         """Reset the robot to its default state.
@@ -292,9 +444,9 @@ class FrankaPickPlace:
             self._event = 0
             self._step = 0
 
-            print("Robot reset to default state")
+            self._emit("Robot reset to default state")
         else:
-            print("Warning: Franka controller not initialized, cannot reset")
+            self._emit("Warning: Franka controller not initialized, cannot reset")
 
     def reset_cube(self, position: Optional[np.ndarray] = None, orientation: Optional[np.ndarray] = None):
         """Reset the cube to its initial position and orientation.
@@ -316,6 +468,73 @@ class FrankaPickPlace:
                 linear_velocities=np.zeros((1, 3)), angular_velocities=np.zeros((1, 3))
             )
 
-            print(f"Cube reset to position: {reset_position}")
+            self._emit(f"Cube reset to position: {reset_position}")
         else:
-            print("Warning: Cube not initialized, cannot reset")
+            self._emit("Warning: Cube not initialized, cannot reset")
+
+    def observe(self, label: str = "observe") -> Dict[str, Any]:
+        """Record one observation without issuing a robot command."""
+        return self._observe(label=label)
+
+    def get_trace(self) -> List[Dict[str, Any]]:
+        """Return the per-step trace collected for the current run."""
+        return list(self._trace)
+
+    def get_phase_history(self) -> List[Dict[str, Any]]:
+        """Return phase-entry records collected for the current run."""
+        return list(self._phase_history)
+
+    def evaluate_success(self, xy_tolerance: float = 0.08, z_tolerance: float = 0.06) -> Dict[str, Any]:
+        """Evaluate physical placement, not just state-machine completion.
+
+        A successful run must show evidence that the cube was lifted and then
+        released near the target on the tabletop. The lift and end-effector
+        distance metrics are retained to distinguish contact/grasp failures
+        from a placement or success-criterion failure.
+        """
+        final_observation = self._observe(label="final")
+        final_position = np.asarray(final_observation.get("cube_position", [np.nan] * 3), dtype=float)
+        target_position = np.asarray(self.target_position, dtype=float)
+        tabletop_position = target_position.copy()
+        tabletop_position[2] = float(self.cube_size[2]) / 2.0
+        final_xy_error = float(np.linalg.norm(final_position[:2] - target_position[:2]))
+        final_z_error = float(abs(final_position[2] - tabletop_position[2]))
+        max_lift = float(self._max_cube_height - self._run_start_cube_position[2])
+
+        lifted = max_lift >= 0.05
+        placed_xy = final_xy_error <= xy_tolerance
+        placed_on_table = final_z_error <= z_tolerance
+        success = bool(self.is_done() and lifted and placed_xy and placed_on_table)
+
+        reasons = []
+        if not self.is_done():
+            reasons.append("state_machine_incomplete")
+        if not lifted:
+            reasons.append("cube_not_lifted")
+        if not placed_xy:
+            reasons.append("final_xy_out_of_tolerance")
+        if not placed_on_table:
+            reasons.append("final_z_out_of_tolerance")
+
+        return {
+            "success": success,
+            "state_machine_complete": bool(self.is_done()),
+            "lifted": lifted,
+            "placed_xy": placed_xy,
+            "placed_on_table": placed_on_table,
+            "failure_reasons": reasons,
+            "initial_cube_position": self._run_start_cube_position.tolist(),
+            "target_position": target_position.tolist(),
+            "expected_tabletop_position": tabletop_position.tolist(),
+            "final_cube_position": final_position.tolist(),
+            "final_xy_error_m": final_xy_error,
+            "final_z_error_m": final_z_error,
+            "max_cube_height_m": float(self._max_cube_height),
+            "max_lift_m": max_lift,
+            "min_cube_ee_distance_during_lift_m": (
+                None
+                if not np.isfinite(self._min_cube_ee_distance_during_lift)
+                else float(self._min_cube_ee_distance_during_lift)
+            ),
+            "final_end_effector_position": final_observation.get("end_effector_position"),
+        }
