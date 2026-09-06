@@ -35,6 +35,7 @@ class FrankaPickPlace:
         self,
         events_dt: Optional[List[float]] = None,
         reset_settle_steps: int = 15,
+        fault_open_gripper: bool = False,
         log_callback: Optional[Callable[[str], None]] = None,
     ):
         """Initialize the FrankaPickPlace controller.
@@ -44,11 +45,13 @@ class FrankaPickPlace:
         Args:
             events_dt: List of step counts for each phase. If None, uses default values.
             reset_settle_steps: Number of simulation steps to hold the reset state before moving.
+            fault_open_gripper: Keep the fingers open during phase 2 instead of grasping.
             log_callback: Optional callback for experiment logging.
         """
         self.cube = None
         self.robot = None
         self.reset_settle_steps = max(0, int(reset_settle_steps))
+        self.fault_open_gripper = bool(fault_open_gripper)
         self._log_callback = log_callback
         self._run_start_cube_position = None
         self._lift_target = None
@@ -284,17 +287,23 @@ class FrankaPickPlace:
         # Phase 2: Close gripper to grasp the cube
         elif self._event == 2:
             if self._step == 0:
-                self._emit("Phase 2: Closing gripper...")
+                grasp_command = "open" if self.fault_open_gripper else "close"
+                if self.fault_open_gripper:
+                    self._emit("FAULT_INJECTED name=open-gripper-during-grasp command=open_gripper")
+                self._emit(f"Phase 2: Grasp command={grasp_command}...")
                 self._phase_history.append(
                     {
                         "event": self._event,
                         "phase": self.phase_name,
                         "run_step": self._run_step_count,
+                        "grasp_command": grasp_command,
                     }
                 )
 
-            # Close gripper
-            self.robot.close_gripper()
+            if self.fault_open_gripper:
+                self.robot.open_gripper()
+            else:
+                self.robot.close_gripper()
 
             self._step += 1
             if self._step >= self.events_dt[2]:

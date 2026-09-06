@@ -74,6 +74,11 @@ parser.add_argument(
     action="store_true",
     help="Record one viewport MP4 per run (requires an active viewport, normally --webrtc)",
 )
+parser.add_argument(
+    "--fault-open-gripper",
+    action="store_true",
+    help="Inject the first controlled fault: keep the gripper open during the grasp phase",
+)
 args, _ = parser.parse_known_args()
 if args.repeat < 0:
     parser.error("--repeat must be 0 or a positive integer")
@@ -145,7 +150,11 @@ if args.webrtc:
 session_name = datetime.now().strftime("session-%Y%m%d-%H%M%S")
 session_dir = args.results_dir / session_name
 logger = ExperimentLogger(session_dir)
-logger.log(f"SESSION_START dir={session_dir} seed={args.seed} repeat={args.repeat} device={args.device}")
+fault_name = "open-gripper-during-grasp" if args.fault_open_gripper else None
+logger.log(
+    f"SESSION_START dir={session_dir} seed={args.seed} repeat={args.repeat} "
+    f"device={args.device} fault={fault_name or 'none'}"
+)
 
 simulation_app = SimulationApp(simulation_config)
 
@@ -331,6 +340,7 @@ def main():
 
     pick_place = FrankaPickPlace(
         reset_settle_steps=args.reset_settle_steps,
+        fault_open_gripper=args.fault_open_gripper,
         log_callback=logger.log,
     )
     pick_place.setup_scene()
@@ -498,6 +508,10 @@ def main():
             "reset_settle_steps": args.reset_settle_steps,
             "post_run_settle_steps": args.post_run_settle_steps,
             "record_video": args.record_video,
+            "fault": {
+                "active": args.fault_open_gripper,
+                "name": fault_name,
+            },
         },
         "completed_runs": completed_runs,
         "runs": [

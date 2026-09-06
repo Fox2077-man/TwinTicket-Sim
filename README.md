@@ -114,6 +114,29 @@ target, and the final cube height is within 0.06 m of the tabletop. This avoids
 counting a motion sequence that merely reached its last phase as a physical
 pick-and-place success.
 
+## First controlled fault: open gripper during grasp
+
+`--fault-open-gripper` changes exactly one commanded behavior: during the grasp
+phase the fingers remain at their fully open position instead of closing. The
+robot path, phase durations, cube pose, target, physics settings, and random
+seed are unchanged. The option is off by default, so removing it restores the
+normal behavior.
+
+Run a matched normal/fault pair by keeping every option except the fault switch
+identical:
+
+```bash
+python run_franka_pick_place.py --webrtc --record-video --auto-start --repeat 1 \
+  --device cpu --seed 0 --results-dir artifacts/controlled-fault-01/normal
+python run_franka_pick_place.py --webrtc --record-video --auto-start --repeat 1 \
+  --device cpu --seed 0 --fault-open-gripper \
+  --results-dir artifacts/controlled-fault-01/fault
+```
+
+The selected fault is recorded in `summary.json`, and the faulted phase emits a
+`FAULT_INJECTED` entry in `experiment.log`. Per-step finger positions remain
+available in `trace.jsonl` as DOFs 7 and 8.
+
 When running in the NVIDIA Docker image, the container uses UID 1234. Make the
 results directory writable before a host-mounted run if necessary:
 
