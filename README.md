@@ -137,6 +137,66 @@ The selected fault is recorded in `summary.json`, and the faulted phase emits a
 `FAULT_INJECTED` entry in `experiment.log`. Per-step finger positions remain
 available in `trace.jsonl` as DOFs 7 and 8.
 
+## Second controlled fault: zero cube friction
+
+`--fault-zero-cube-friction` keeps the normal robot path and normal gripper
+close command, but binds a zero-friction physics material to the cube collision
+surface. Its static and dynamic friction are both `0.0`, and the `min` combine
+mode makes the resulting finger-cube friction zero. Without tangential contact
+force, the gripper cannot carry the cube upward. Removing the option restores
+the default cube contact material.
+
+The three fault switches are mutually exclusive, so they cannot accidentally be
+active in the same run:
+
+```bash
+python run_franka_pick_place.py --webrtc --record-video --auto-start --repeat 1 \
+  --device cpu --seed 0 --fault-zero-cube-friction \
+  --results-dir artifacts/controlled-fault-02/zero-friction
+```
+
+Both faults should visibly leave the cube near its starting position. Their
+records distinguish the causes: the first fault has `grasp_command: open` and
+open finger DOFs, while the second has `grasp_command: close`, closed finger
+DOFs, and `contact_condition: zero_cube_friction`.
+
+## Third controlled fault: high grasp approach
+
+`--fault-high-grasp-approach` changes only the motion geometry: during the
+approach phase the end effector targets a point `0.08 m` higher than the normal
+grasp pose. The cube pose, robot reset, normal `close_gripper` command, and
+default contact material are unchanged, so the fingers close above the cube
+without making a geometric grasp. Removing the option restores the normal
+approach height.
+
+All three fault switches are mutually exclusive. A third-fault run can be
+recorded with:
+
+```bash
+python run_franka_pick_place.py --webrtc --record-video --auto-start --repeat 1 \
+  --device cpu --seed 0 --fault-high-grasp-approach \
+  --results-dir artifacts/controlled-fault-03/high-grasp-approach
+```
+
+The third-fault record identifies `cause_path: approach_geometry`,
+`grasp_command: close`, `contact_condition: default`,
+`grasp_height_offset_m: 0.08`, and the larger
+`grasp_ee_distance_at_command_m`. This separates it from the open-command and
+zero-friction faults without changing the cube's starting position.
+
+## Fault stability acceptance
+
+Before collecting formal data, each fault was run independently 10 times with
+the matched baseline settings (`seed=0`, CPU, fixed cube pose, and 15/30 settle
+frames). The normal configuration succeeded 10/10; open-gripper, zero-friction,
+and high-grasp-approach each failed 10/10, completed all 325 simulation steps,
+and produced no runtime error or incomplete trace. The detailed statistics and
+session paths are recorded in
+`artifacts/controlled-fault-stability/stability-report.md`.
+
+This is a reset-repeatability check at one fixed seed, not a cross-seed
+statistical robustness study.
+
 When running in the NVIDIA Docker image, the container uses UID 1234. Make the
 results directory writable before a host-mounted run if necessary:
 

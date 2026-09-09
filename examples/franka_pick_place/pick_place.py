@@ -17,7 +17,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import isaacsim.core.experimental.utils.stage as stage_utils
 import numpy as np
-from isaacsim.core.experimental.materials import PreviewSurfaceMaterial
+from isaacsim.core.experimental.materials import PreviewSurfaceMaterial, RigidBodyMaterial
 from isaacsim.core.experimental.objects import Cube
 from isaacsim.core.experimental.prims import GeomPrim, RigidPrim
 from .franka_experimental import FrankaExperimental
@@ -36,6 +36,8 @@ class FrankaPickPlace:
         events_dt: Optional[List[float]] = None,
         reset_settle_steps: int = 15,
         fault_open_gripper: bool = False,
+        fault_zero_cube_friction: bool = False,
+        fault_high_grasp_approach: bool = False,
         log_callback: Optional[Callable[[str], None]] = None,
     ):
         """Initialize the FrankaPickPlace controller.
@@ -46,12 +48,25 @@ class FrankaPickPlace:
             events_dt: List of step counts for each phase. If None, uses default values.
             reset_settle_steps: Number of simulation steps to hold the reset state before moving.
             fault_open_gripper: Keep the fingers open during phase 2 instead of grasping.
+            fault_zero_cube_friction: Remove friction from the cube collision surface.
+            fault_high_grasp_approach: Approach the grasp pose 0.08 m too high.
             log_callback: Optional callback for experiment logging.
         """
         self.cube = None
         self.robot = None
         self.reset_settle_steps = max(0, int(reset_settle_steps))
         self.fault_open_gripper = bool(fault_open_gripper)
+        self.fault_zero_cube_friction = bool(fault_zero_cube_friction)
+        self.fault_high_grasp_approach = bool(fault_high_grasp_approach)
+        if sum(
+            (
+                self.fault_open_gripper,
+                self.fault_zero_cube_friction,
+                self.fault_high_grasp_approach,
+            )
+        ) > 1:
+            raise ValueError("controlled fault options are mutually exclusive")
+        self.grasp_height_offset_m = 0.08 if self.fault_high_grasp_approach else 0.0
         self._log_callback = log_callback
         self._run_start_cube_position = None
         self._lift_target = None
@@ -62,6 +77,8 @@ class FrankaPickPlace:
         self._phase_history: List[Dict[str, Any]] = []
         self._max_cube_height = float("-inf")
         self._min_cube_ee_distance_during_lift = float("inf")
+        self._min_gripper_finger_sum_during_grasp = float("inf")
+        self._grasp_ee_distance_at_command = None
         self._last_observation = None
 
         # Define step counts for each phase
@@ -111,6 +128,11 @@ class FrankaPickPlace:
         if self._event >= 3:
             self._min_cube_ee_distance_during_lift = min(
                 self._min_cube_ee_distance_during_lift, cube_ee_distance
+            )
+        if 2 <= self._event <= 4 and dof_positions.shape[0] >= 9:
+            self._min_gripper_finger_sum_during_grasp = min(
+                self._min_gripper_finger_sum_during_grasp,
+                float(dof_positions[7] + dof_positions[8]),
             )
 
         observation = {
@@ -206,7 +228,20 @@ class FrankaPickPlace:
             reset_xform_op_properties=True,
         )
 
-        GeomPrim(paths=cube_shape.paths, apply_collision_apis=True)
+        cube_geom = GeomPrim(paths=cube_shape.paths, apply_collision_apis=True)
+        if self.fault_zero_cube_friction:
+            zero_friction_material = RigidBodyMaterial(
+                "/World/PhysicsMaterials/zero_cube_friction",
+                static_frictions=[0.0],
+                dynamic_frictions=[0.0],
+                restitutions=[0.0],
+            )
+            zero_friction_material.set_combine_modes(frictions=["min"])
+            cube_geom.apply_physics_materials(zero_friction_material)
+            self._emit(
+                "FAULT_CONFIGURED name=zero-cube-friction "
+                "static_friction=0.0 dynamic_friction=0.0 combine=min"
+            )
         self.cube = RigidPrim(paths=cube_shape.paths)
         cube_shape.apply_visual_materials(visual_material)
 
@@ -273,8 +308,11 @@ class FrankaPickPlace:
                     }
                 )
 
-            # Approach the fixed cube pose at a repeatable height.
-            goal_position = self._run_start_cube_position + np.array([0.0, 0.0, 0.1])
+            # Approach the fixed cube pose at a repeatable height. The third
+            # controlled fault adds only a vertical motion offset here.
+            goal_position = self._run_start_cube_position + np.array(
+                [0.0, 0.0, 0.1 + self.grasp_height_offset_m]
+            )
 
             # Move to position using the controller
             self.robot.set_end_effector_pose(position=goal_position, orientation=goal_orientation, ik_method=ik_method)
@@ -290,6 +328,21 @@ class FrankaPickPlace:
                 grasp_command = "open" if self.fault_open_gripper else "close"
                 if self.fault_open_gripper:
                     self._emit("FAULT_INJECTED name=open-gripper-during-grasp command=open_gripper")
+                elif self.fault_zero_cube_friction:
+                    self._emit(
+                        "FAULT_INJECTED name=zero-cube-friction "
+                        "command=close_gripper static_friction=0.0 dynamic_friction=0.0 combine=min"
+                    )
+                elif self.fault_high_grasp_approach:
+                    self._emit(
+                        "FAULT_INJECTED name=high-grasp-approach "
+                        "command=close_gripper height_offset_m=0.08 contact=default"
+                    )
+                self._grasp_ee_distance_at_command = (
+                    None
+                    if self._last_observation is None
+                    else float(self._last_observation["cube_ee_distance"])
+                )
                 self._emit(f"Phase 2: Grasp command={grasp_command}...")
                 self._phase_history.append(
                     {
@@ -297,6 +350,14 @@ class FrankaPickPlace:
                         "phase": self.phase_name,
                         "run_step": self._run_step_count,
                         "grasp_command": grasp_command,
+                        "contact_condition": (
+                            "zero_cube_friction" if self.fault_zero_cube_friction else "default"
+                        ),
+                        "approach_condition": (
+                            "high_grasp_approach" if self.fault_high_grasp_approach else "default"
+                        ),
+                        "grasp_height_offset_m": self.grasp_height_offset_m,
+                        "grasp_ee_distance_at_command_m": self._grasp_ee_distance_at_command,
                     }
                 )
 
@@ -436,6 +497,8 @@ class FrankaPickPlace:
         self._phase_history = []
         self._max_cube_height = float(self._run_start_cube_position[2])
         self._min_cube_ee_distance_during_lift = float("inf")
+        self._min_gripper_finger_sum_during_grasp = float("inf")
+        self._grasp_ee_distance_at_command = None
         self._last_observation = None
         self._emit("Pick-and-place system reset complete")
 
@@ -545,5 +608,11 @@ class FrankaPickPlace:
                 if not np.isfinite(self._min_cube_ee_distance_during_lift)
                 else float(self._min_cube_ee_distance_during_lift)
             ),
+            "min_gripper_finger_sum_during_grasp_m": (
+                None
+                if not np.isfinite(self._min_gripper_finger_sum_during_grasp)
+                else float(self._min_gripper_finger_sum_during_grasp)
+            ),
+            "grasp_ee_distance_at_command_m": self._grasp_ee_distance_at_command,
             "final_end_effector_position": final_observation.get("end_effector_position"),
         }

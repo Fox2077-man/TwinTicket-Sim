@@ -74,10 +74,21 @@ parser.add_argument(
     action="store_true",
     help="Record one viewport MP4 per run (requires an active viewport, normally --webrtc)",
 )
-parser.add_argument(
+fault_group = parser.add_mutually_exclusive_group()
+fault_group.add_argument(
     "--fault-open-gripper",
     action="store_true",
     help="Inject the first controlled fault: keep the gripper open during the grasp phase",
+)
+fault_group.add_argument(
+    "--fault-zero-cube-friction",
+    action="store_true",
+    help="Inject the second controlled fault: remove friction from the cube contact surface",
+)
+fault_group.add_argument(
+    "--fault-high-grasp-approach",
+    action="store_true",
+    help="Inject the third controlled fault: approach the grasp pose 0.08 m too high",
 )
 args, _ = parser.parse_known_args()
 if args.repeat < 0:
@@ -150,7 +161,28 @@ if args.webrtc:
 session_name = datetime.now().strftime("session-%Y%m%d-%H%M%S")
 session_dir = args.results_dir / session_name
 logger = ExperimentLogger(session_dir)
-fault_name = "open-gripper-during-grasp" if args.fault_open_gripper else None
+if args.fault_open_gripper:
+    fault_name = "open-gripper-during-grasp"
+    fault_details = {"cause_path": "gripper_command", "grasp_command": "open"}
+elif args.fault_zero_cube_friction:
+    fault_name = "zero-cube-friction"
+    fault_details = {
+        "cause_path": "contact_friction",
+        "cube_static_friction": 0.0,
+        "cube_dynamic_friction": 0.0,
+        "friction_combine_mode": "min",
+    }
+elif args.fault_high_grasp_approach:
+    fault_name = "high-grasp-approach"
+    fault_details = {
+        "cause_path": "approach_geometry",
+        "grasp_height_offset_m": 0.08,
+        "grasp_command": "close",
+        "contact_condition": "default",
+    }
+else:
+    fault_name = None
+    fault_details = {}
 logger.log(
     f"SESSION_START dir={session_dir} seed={args.seed} repeat={args.repeat} "
     f"device={args.device} fault={fault_name or 'none'}"
@@ -341,6 +373,8 @@ def main():
     pick_place = FrankaPickPlace(
         reset_settle_steps=args.reset_settle_steps,
         fault_open_gripper=args.fault_open_gripper,
+        fault_zero_cube_friction=args.fault_zero_cube_friction,
+        fault_high_grasp_approach=args.fault_high_grasp_approach,
         log_callback=logger.log,
     )
     pick_place.setup_scene()
@@ -509,8 +543,9 @@ def main():
             "post_run_settle_steps": args.post_run_settle_steps,
             "record_video": args.record_video,
             "fault": {
-                "active": args.fault_open_gripper,
+                "active": fault_name is not None,
                 "name": fault_name,
+                **fault_details,
             },
         },
         "completed_runs": completed_runs,
