@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -88,6 +89,28 @@ def sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def video_markdown_link(batch_root: Path, stored_path: str) -> str:
+    """Render stored video paths as links relative to the batch index."""
+    if not stored_path or stored_path == "n/a":
+        return "n/a"
+    stored = Path(stored_path)
+    target = stored
+    marker = "/artifacts/"
+    if marker in stored_path:
+        relative_to_repo = Path(stored_path.split(marker, 1)[1])
+        repo_root = next(
+            (parent.parent for parent in (batch_root, *batch_root.parents) if parent.name == "artifacts"),
+            None,
+        )
+        if repo_root is not None:
+            target = repo_root / "artifacts" / relative_to_repo
+    try:
+        relative = Path(os.path.relpath(target, batch_root)).as_posix()
+    except ValueError:
+        relative = stored_path
+    return f"[打开视频]({relative})"
 
 
 def slots() -> Iterable[Dict[str, str]]:
@@ -330,7 +353,10 @@ def write_reports(root: Path, state: Dict[str, Any]) -> None:
             continue
         video = (accepted_attempt.get("files") or {}).get("run-001.mp4", {}).get("path", "n/a")
         success = (accepted_attempt.get("metrics") or {}).get("success")
-        lines.append(f"| `{slot_id}` | {accepted_attempt['attempt']} | `{success}` | accepted | `{video}` |")
+        lines.append(
+            f"| `{slot_id}` | {accepted_attempt['attempt']} | `{success}` | accepted | "
+            f"{video_markdown_link(root, video)} |"
+        )
     lines.extend([
         "",
         "## 全部实际尝试",
@@ -345,7 +371,7 @@ def write_reports(root: Path, state: Dict[str, Any]) -> None:
             video = (attempt.get("files") or {}).get("run-001.mp4", {}).get("path", "n/a")
             lines.append(
                 f"| `{slot_id}` | {attempt['attempt']} | `{outcome}` | "
-                f"`{attempt.get('status')}` | `{video}` | `{errors}` |"
+                f"`{attempt.get('status')}` | {video_markdown_link(root, video)} | `{errors}` |"
             )
     (root / "batch-index.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
