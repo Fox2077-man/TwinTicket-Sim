@@ -52,6 +52,19 @@ parser.add_argument(
 )
 parser.add_argument("--seed", type=int, default=0, help="Seed Python and NumPy random generators")
 parser.add_argument(
+    "--start-condition-id",
+    default="default",
+    help="Stable identifier recorded with the initial scene condition",
+)
+parser.add_argument(
+    "--cube-initial-position",
+    type=float,
+    nargs=3,
+    metavar=("X", "Y", "Z"),
+    default=None,
+    help="Override the cube initial position in meters",
+)
+parser.add_argument(
     "--reset-settle-steps",
     type=int,
     default=15,
@@ -90,6 +103,72 @@ fault_group.add_argument(
     action="store_true",
     help="Inject the third controlled fault: approach the grasp pose 0.08 m too high",
 )
+fault_group.add_argument(
+    "--fault1-variant",
+    choices=["normal", "injected-fault", "wrong-cause", "true-fix"],
+    default=None,
+    help=(
+        "Run one reproducible Fault 1 comparison variant. The wrong-cause variant "
+        "preserves the open-gripper fault while applying a plausible friction diagnosis; "
+        "true-fix restores only the close command."
+    ),
+)
+fault_group.add_argument(
+    "--fault1-wrong-cause",
+    dest="fault1_wrong_cause",
+    action="store_true",
+    help="Alias for --fault1-variant wrong-cause",
+)
+fault_group.add_argument(
+    "--fault1-true-fix",
+    dest="fault1_true_fix",
+    action="store_true",
+    help="Alias for --fault1-variant true-fix",
+)
+fault_group.add_argument(
+    "--fault2-variant",
+    choices=["normal", "injected-fault", "wrong-cause", "true-fix"],
+    default=None,
+    help=(
+        "Run one reproducible Fault 2 comparison variant. The wrong-cause variant "
+        "repeats the close command while preserving zero cube friction; true-fix "
+        "restores the default cube contact material."
+    ),
+)
+fault_group.add_argument(
+    "--fault3-variant",
+    choices=["normal", "injected-fault", "wrong-cause", "true-fix"],
+    default=None,
+    help=(
+        "Run one reproducible Fault 3 comparison variant. The wrong-cause variant "
+        "checks the height reference while preserving the high approach; true-fix "
+        "restores the normal grasp height."
+    ),
+)
+parser.add_argument(
+    "--midway-drop-cause",
+    choices=["gripper-release", "friction-loss", "motion-disturbance"],
+    default=None,
+    help="Cause used by the mid-transport drop comparison",
+)
+parser.add_argument(
+    "--midway-drop-variant",
+    choices=["normal", "injected-fault", "wrong-cause", "true-fix"],
+    default="normal",
+    help="Variant used by the mid-transport drop comparison",
+)
+parser.add_argument(
+    "--misplacement-cause",
+    choices=["planner-x-offset", "transport-y-bias", "early-release"],
+    default=None,
+    help="Cause used by the inaccurate-placement comparison",
+)
+parser.add_argument(
+    "--misplacement-variant",
+    choices=["normal", "injected-fault", "wrong-cause", "true-fix"],
+    default="normal",
+    help="Variant used by the inaccurate-placement comparison",
+)
 args, _ = parser.parse_known_args()
 if args.repeat < 0:
     parser.error("--repeat must be 0 or a positive integer")
@@ -98,6 +177,52 @@ if args.reset_settle_steps < 0 or args.post_run_settle_steps < 0:
 
 random.seed(args.seed)
 np.random.seed(args.seed)
+
+
+def resolve_fault1_variant(parsed_args: argparse.Namespace) -> str:
+    """Normalize explicit Fault 1 comparison aliases without changing legacy flags."""
+    if parsed_args.fault1_variant is not None:
+        return parsed_args.fault1_variant
+    if parsed_args.fault1_wrong_cause:
+        return "wrong-cause"
+    if parsed_args.fault1_true_fix:
+        return "true-fix"
+    if parsed_args.fault_open_gripper:
+        return "injected-fault"
+    return "normal"
+
+
+fault1_variant = resolve_fault1_variant(args)
+
+
+def resolve_fault_variant(
+    explicit_variant: Optional[str], legacy_fault: bool, fault_number: int
+) -> str:
+    if explicit_variant is not None:
+        return explicit_variant
+    if legacy_fault:
+        return "injected-fault"
+    return "normal"
+
+
+fault2_variant = resolve_fault_variant(args.fault2_variant, args.fault_zero_cube_friction, 2)
+fault3_variant = resolve_fault_variant(args.fault3_variant, args.fault_high_grasp_approach, 3)
+comparison_variants = [
+    ("fault1", fault1_variant),
+    ("fault2", fault2_variant),
+    ("fault3", fault3_variant),
+]
+active_comparisons = [(fault, variant) for fault, variant in comparison_variants if variant != "normal"]
+if args.midway_drop_variant != "normal":
+    active_comparisons.append(("midway-drop", args.midway_drop_variant))
+if args.misplacement_variant != "normal":
+    active_comparisons.append(("misplacement", args.misplacement_variant))
+if len(active_comparisons) > 1:
+    parser.error("only one fault comparison variant may be active per run")
+if args.midway_drop_variant != "normal" and args.midway_drop_cause is None:
+    parser.error("--midway-drop-cause is required when --midway-drop-variant is not normal")
+if args.misplacement_variant != "normal" and args.misplacement_cause is None:
+    parser.error("--misplacement-cause is required when --misplacement-variant is not normal")
 
 
 class ExperimentLogger:
@@ -183,9 +308,158 @@ elif args.fault_high_grasp_approach:
 else:
     fault_name = None
     fault_details = {}
+if fault1_variant == "injected-fault":
+    fault_name = "open-gripper-during-grasp"
+    fault_details = {
+        "cause_path": "gripper_command",
+        "grasp_command": "open",
+        "true_cause": "gripper_command_open",
+    }
+elif fault1_variant == "wrong-cause":
+    # The wrong diagnosis is deliberately applied alongside the unchanged open
+    # command. This makes it impossible for error handling to mask the true cause.
+    fault_name = "open-gripper-during-grasp"
+    fault_details = {
+        "cause_path": "gripper_command",
+        "grasp_command": "open",
+        "true_cause": "gripper_command_open",
+        "diagnosis": "contact_friction",
+        "diagnosis_action": "increase_cube_friction",
+        "cube_static_friction": 1.0,
+        "cube_dynamic_friction": 1.0,
+        "friction_combine_mode": "max",
+        "true_cause_preserved": True,
+    }
+elif fault1_variant == "true-fix":
+    fault_name = None
+    fault_details = {
+        "cause_path": "gripper_command",
+        "grasp_command": "close",
+        "repair": "restore_close_gripper",
+        "true_cause_modified": True,
+    }
+if fault2_variant == "injected-fault":
+    fault_name = "zero-cube-friction"
+    fault_details = {
+        "cause_path": "contact_friction",
+        "cube_static_friction": 0.0,
+        "cube_dynamic_friction": 0.0,
+        "friction_combine_mode": "min",
+        "true_cause": "cube_zero_friction",
+    }
+elif fault2_variant == "wrong-cause":
+    fault_name = "zero-cube-friction"
+    fault_details = {
+        "cause_path": "contact_friction",
+        "cube_static_friction": 0.0,
+        "cube_dynamic_friction": 0.0,
+        "friction_combine_mode": "min",
+        "true_cause": "cube_zero_friction",
+        "diagnosis": "height_reference_calibration",
+        "diagnosis_action": "verify_cube_top_height",
+        "true_cause_preserved": True,
+    }
+elif fault2_variant == "true-fix":
+    fault_name = None
+    fault_details = {
+        "cause_path": "contact_friction",
+        "repair": "restore_default_cube_contact_material",
+        "true_cause_modified": True,
+    }
+if fault3_variant == "injected-fault":
+    fault_name = "high-grasp-approach"
+    fault_details = {
+        "cause_path": "approach_geometry",
+        "grasp_height_offset_m": 0.08,
+        "grasp_command": "close",
+        "contact_condition": "default",
+        "true_cause": "approach_height_offset",
+    }
+elif fault3_variant == "wrong-cause":
+    fault_name = "high-grasp-approach"
+    fault_details = {
+        "cause_path": "approach_geometry",
+        "grasp_height_offset_m": 0.08,
+        "grasp_command": "close",
+        "contact_condition": "default",
+        "true_cause": "approach_height_offset",
+        "diagnosis": "height_reference_calibration",
+        "diagnosis_action": "verify_cube_top_height",
+        "true_cause_preserved": True,
+    }
+elif fault3_variant == "true-fix":
+    fault_name = None
+    fault_details = {
+        "cause_path": "approach_geometry",
+        "repair": "restore_normal_grasp_height",
+        "true_cause_modified": True,
+    }
+if args.midway_drop_cause is not None:
+    midway_cause_details = {
+        "gripper-release": {
+            "true_cause": "gripper_command_open_during_transport",
+            "wrong_diagnosis": "contact_friction",
+            "wrong_diagnosis_action": "increase_cube_friction",
+        },
+        "friction-loss": {
+            "true_cause": "finger_cube_collision_disabled_during_transport",
+            "wrong_diagnosis": "gripper_command",
+            "wrong_diagnosis_action": "repeat_close",
+        },
+        "motion-disturbance": {
+            "true_cause": "downward_disturbance_velocity",
+            "wrong_diagnosis": "gripper_command",
+            "wrong_diagnosis_action": "verify_close_command",
+        },
+    }[args.midway_drop_cause]
+    fault_name = f"midway-drop-{args.midway_drop_cause}"
+    fault_details = {
+        "cause_path": f"midway_drop.{args.midway_drop_cause}",
+        "midway_drop_cause": args.midway_drop_cause,
+        "midway_drop_variant": args.midway_drop_variant,
+        "true_cause": midway_cause_details["true_cause"],
+        "true_cause_preserved": args.midway_drop_variant == "wrong-cause",
+        "true_cause_modified": args.midway_drop_variant == "true-fix",
+    }
+    if args.midway_drop_variant == "wrong-cause":
+        fault_details.update({
+            "diagnosis": midway_cause_details["wrong_diagnosis"],
+            "diagnosis_action": midway_cause_details["wrong_diagnosis_action"],
+        })
+    elif args.midway_drop_variant == "true-fix":
+        fault_details["repair"] = f"remove_{midway_cause_details['true_cause']}"
+if args.misplacement_cause is not None:
+    cause_details = {
+        "planner-x-offset": {
+            "true_cause": "planner_release_target_x_offset",
+            "planner_offset_m": [0.16, 0.0, 0.0],
+        },
+        "transport-y-bias": {
+            "true_cause": "transport_controller_y_command_bias",
+            "transport_command_bias_m": [0.0, 0.16, 0.0],
+        },
+        "early-release": {
+            "true_cause": "open_gripper_before_target",
+            "early_release_phase_step": 32,
+        },
+    }[args.misplacement_cause]
+    fault_name = f"misplacement-{args.misplacement_cause}"
+    fault_details = {
+        "cause_path": f"misplacement.{args.misplacement_cause}",
+        "misplacement_cause": args.misplacement_cause,
+        "misplacement_variant": args.misplacement_variant,
+        **cause_details,
+        "true_cause_preserved": args.misplacement_variant == "wrong-cause",
+        "true_cause_modified": args.misplacement_variant == "true-fix",
+    }
 logger.log(
     f"SESSION_START dir={session_dir} seed={args.seed} repeat={args.repeat} "
-    f"device={args.device} fault={fault_name or 'none'}"
+    f"start_condition_id={args.start_condition_id} "
+    f"cube_initial_position={args.cube_initial_position or 'default'} "
+    f"device={args.device} fault={fault_name or 'none'} "
+    f"fault1_variant={fault1_variant} fault2_variant={fault2_variant} fault3_variant={fault3_variant} "
+    f"midway_drop_cause={args.midway_drop_cause or 'none'} midway_drop_variant={args.midway_drop_variant} "
+    f"misplacement_cause={args.misplacement_cause or 'none'} misplacement_variant={args.misplacement_variant}"
 )
 
 simulation_app = SimulationApp(simulation_config)
@@ -372,12 +646,22 @@ def main():
 
     pick_place = FrankaPickPlace(
         reset_settle_steps=args.reset_settle_steps,
-        fault_open_gripper=args.fault_open_gripper,
-        fault_zero_cube_friction=args.fault_zero_cube_friction,
-        fault_high_grasp_approach=args.fault_high_grasp_approach,
+        fault_open_gripper=args.fault_open_gripper or fault1_variant in {"injected-fault", "wrong-cause"},
+        fault_zero_cube_friction=args.fault_zero_cube_friction or fault2_variant in {"injected-fault", "wrong-cause"},
+        fault_high_grasp_approach=args.fault_high_grasp_approach or fault3_variant in {"injected-fault", "wrong-cause"},
+        fault1_variant=fault1_variant,
+        fault2_variant=fault2_variant,
+        fault3_variant=fault3_variant,
+        midway_drop_cause=args.midway_drop_cause,
+        midway_drop_variant=args.midway_drop_variant,
+        misplacement_cause=args.misplacement_cause,
+        misplacement_variant=args.misplacement_variant,
         log_callback=logger.log,
     )
-    pick_place.setup_scene()
+    cube_initial_position = (
+        None if args.cube_initial_position is None else np.asarray(args.cube_initial_position, dtype=float)
+    )
+    pick_place.setup_scene(cube_initial_position=cube_initial_position)
 
     # Let USD references, articulation tensors, and the viewport finish their
     # initial update before the first reset is measured.
@@ -483,6 +767,14 @@ def main():
         task_done_monotonic = current_run["task_done_monotonic"] or finished_monotonic
         run_record = {
             "run": run_number,
+            "fault1_variant": fault1_variant,
+            "fault2_variant": fault2_variant,
+            "fault3_variant": fault3_variant,
+            "midway_drop_cause": args.midway_drop_cause,
+            "midway_drop_variant": args.midway_drop_variant,
+            "misplacement_cause": args.misplacement_cause,
+            "misplacement_variant": args.misplacement_variant,
+            "fault": fault_name,
             "started_at": current_run["started_at"],
             "finished_at": datetime.now(timezone.utc).isoformat(),
             "task_elapsed_wall_seconds": task_done_monotonic - current_run["started_monotonic"],
@@ -536,12 +828,28 @@ def main():
         "session": session_name,
         "config": {
             "seed": args.seed,
+            "start_condition_id": args.start_condition_id,
             "repeat": args.repeat,
             "device": args.device,
             "ik_method": args.ik_method,
             "reset_settle_steps": args.reset_settle_steps,
             "post_run_settle_steps": args.post_run_settle_steps,
             "record_video": args.record_video,
+            "fault1_variant": fault1_variant,
+            "fault2_variant": fault2_variant,
+            "fault3_variant": fault3_variant,
+            "midway_drop_cause": args.midway_drop_cause,
+            "midway_drop_variant": args.midway_drop_variant,
+            "misplacement_cause": args.misplacement_cause,
+            "misplacement_variant": args.misplacement_variant,
+            "task_contract": {
+                "cube_initial_position_m": pick_place.cube_initial_position.tolist(),
+                "cube_size_m": pick_place.cube_size.tolist(),
+                "target_position_m": pick_place.target_position.tolist(),
+                "events_dt_steps": list(pick_place.events_dt),
+                "xy_tolerance_m": 0.08,
+                "z_tolerance_m": 0.06,
+            },
             "fault": {
                 "active": fault_name is not None,
                 "name": fault_name,

@@ -210,3 +210,107 @@ while retaining `artifacts/.gitkeep`.
 
 The official source is available at:
 <https://github.com/isaac-sim/IsaacSim/tree/v5.1.0/source/standalone_examples/api/isaacsim.robot.manipulators/franka>
+
+## Fault 1 four-version causal comparison
+
+To make the first fault (the gripper does not close) a fair causal test, run
+the dedicated comparison driver with the Isaac Sim interpreter:
+
+```bash
+/isaac-sim/python.sh run_fault1_comparison.py \
+  --results-dir artifacts/fault1-comparison
+```
+
+The driver launches four fresh Isaac Sim processes with the same seed, device,
+IK method, reset pose, target, phase durations, and settle steps:
+
+1. `normal`: the grasp phase sends `close_gripper`.
+2. `injected-fault`: the grasp phase sends `open_gripper`.
+3. `wrong-cause`: the open command is deliberately kept, while a plausible
+   but incorrect contact-friction diagnosis raises cube friction. This is an
+   error-handling treatment; it does not remove or replace the true command
+   fault.
+4. `true-fix`: only the command is restored to `close_gripper`; all task
+   difficulty parameters remain the normal values.
+
+Each variant has its own `session-*` directory containing `experiment.log`,
+`summary.json`, `run-001/result.json`, `run-001/trace.jsonl`, and
+`run-001.mp4` when viewport capture is available. The parent directory also
+contains `comparison.json` and `comparison.md`. The report checks that the
+task contract is identical, that wrong-cause handling preserved the open
+command, and that the true fix changed only the command path. The expected
+causal pattern is normal success, injected-fault failure, wrong-cause failure,
+and true-fix success.
+
+## Fault 2 and Fault 3 four-version causal comparisons
+
+The same four-version protocol is available for the other controlled faults:
+
+```bash
+/isaac-sim/python.sh run_fault23_comparison.py --fault 2 \
+  --results-dir artifacts/fault2-comparison
+/isaac-sim/python.sh run_fault23_comparison.py --fault 3 \
+  --results-dir artifacts/fault3-comparison
+```
+
+For Fault 2 (`zero-cube-friction`), `wrong-cause` repeats the normal close
+command as a gripper-command diagnosis while leaving the cube static/dynamic
+friction at `0.0` with `min` combine mode. `true-fix` restores the default cube
+contact material only.
+
+For Fault 3 (`high-grasp-approach`), `wrong-cause` applies a height-related
+reference diagnosis (`verify_cube_top_height`) while retaining the true
+`+0.08 m` approach height offset. It does not repeat the Fault 2 close command
+and does not change the commanded grasp height. `true-fix` restores the normal
+approach height only.
+
+Each comparison writes four independent session directories with MP4 videos,
+`experiment.log`, `summary.json`, `run-001/result.json`, and
+`run-001/trace.jsonl`, plus `comparison.md` and `comparison.json`. The reports
+check identical task contracts, matching pre-grasp trace prefixes, preserved
+root causes in wrong-cause runs, and successful true-fix runs.
+
+## Mid-transport drop comparison
+
+The second symptom uses the same reproducible evidence layout. The cube is
+grasped and lifted first; the selected intervention is applied at the start of
+`move_to_target`, so each fault and wrong-cause run visibly drops the cube
+while the true-fix run completes the placement:
+
+```bash
+/isaac-sim/python.sh run_midway_drop_comparison.py \
+  --results-dir artifacts/midway-drop-comparison
+```
+
+The completed comparison is in `artifacts/midway-drop-comparison/`. It contains
+one `injected-fault`, `wrong-cause`, and `true-fix` session for each cause:
+`gripper-release` (opens the gripper), `friction-loss` (filters only the cube's
+collisions with `panda_hand`, `panda_leftfinger`, and `panda_rightfinger`
+during transport), and `motion-disturbance` (applies a downward velocity).
+Each session has an MP4, `experiment.log`, `summary.json`,
+`run-001/result.json`, and `run-001/trace.jsonl`; the parent
+`comparison.md`/`comparison.json` records the fairness checks and causal
+evidence. A run is marked unsuccessful whenever `drop_detected` is true,
+even if the cube later settles inside the target tolerance.
+
+## Inaccurate-placement comparison
+
+The third symptom keeps the grasp and transport successful but places the cube
+away from the nominal target. It compares three single-cause interventions:
+`planner-x-offset` (the planned release target has only an X offset),
+`transport-y-bias` (the planner target remains correct while only the transport
+command has a Y bias), and `early-release` (the gripper opens at a fixed
+pre-target transport step). Each cause has an `injected-fault`, `wrong-cause`,
+and `true-fix` session:
+
+```bash
+/isaac-sim/python.sh run_misplacement_comparison.py \
+  --results-dir artifacts/misplacement-comparison
+```
+
+Each record preserves the nominal target and records the planned release
+position, commanded transport position, final XY error, and, where applicable,
+the early-release step and distance remaining to the target. The report in
+`artifacts/misplacement-comparison/comparison.md` checks matched control
+prefixes, root-cause preservation in wrong-cause runs, and successful recovery
+from the true fix.

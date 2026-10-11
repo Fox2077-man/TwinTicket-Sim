@@ -17,6 +17,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 import isaacsim.core.experimental.utils.stage as stage_utils
 import numpy as np
+import omni.usd
+from pxr import UsdPhysics
 from isaacsim.core.experimental.materials import PreviewSurfaceMaterial, RigidBodyMaterial
 from isaacsim.core.experimental.objects import Cube
 from isaacsim.core.experimental.prims import GeomPrim, RigidPrim
@@ -38,6 +40,13 @@ class FrankaPickPlace:
         fault_open_gripper: bool = False,
         fault_zero_cube_friction: bool = False,
         fault_high_grasp_approach: bool = False,
+        fault1_variant: str = "normal",
+        fault2_variant: str = "normal",
+        fault3_variant: str = "normal",
+        midway_drop_cause: Optional[str] = None,
+        midway_drop_variant: str = "normal",
+        misplacement_cause: Optional[str] = None,
+        misplacement_variant: str = "normal",
         log_callback: Optional[Callable[[str], None]] = None,
     ):
         """Initialize the FrankaPickPlace controller.
@@ -50,6 +59,20 @@ class FrankaPickPlace:
             fault_open_gripper: Keep the fingers open during phase 2 instead of grasping.
             fault_zero_cube_friction: Remove friction from the cube collision surface.
             fault_high_grasp_approach: Approach the grasp pose 0.08 m too high.
+            fault1_variant: Explicit Fault 1 comparison variant. ``wrong-cause``
+                preserves the open-gripper fault while applying a friction diagnosis;
+                ``true-fix`` restores only the close command.
+            fault2_variant: Explicit Fault 2 comparison variant.
+            fault3_variant: Explicit Fault 3 comparison variant.
+            midway_drop_cause: One of ``gripper-release``, ``friction-loss``,
+                or ``motion-disturbance`` for the mid-task drop experiment.
+            midway_drop_variant: ``injected-fault`` and ``wrong-cause`` keep
+                the selected cause active; ``true-fix`` disables it.
+            misplacement_cause: One of ``planner-x-offset``,
+                ``transport-y-bias``, or ``early-release`` for the inaccurate
+                placement experiment.
+            misplacement_variant: ``injected-fault`` and ``wrong-cause`` keep
+                the selected cause active; ``true-fix`` disables it.
             log_callback: Optional callback for experiment logging.
         """
         self.cube = None
@@ -58,6 +81,46 @@ class FrankaPickPlace:
         self.fault_open_gripper = bool(fault_open_gripper)
         self.fault_zero_cube_friction = bool(fault_zero_cube_friction)
         self.fault_high_grasp_approach = bool(fault_high_grasp_approach)
+        valid_fault1_variants = {"normal", "injected-fault", "wrong-cause", "true-fix"}
+        if fault1_variant not in valid_fault1_variants:
+            raise ValueError(f"invalid Fault 1 variant: {fault1_variant}")
+        self.fault1_variant = fault1_variant
+        self.fault2_variant = fault2_variant
+        self.fault3_variant = fault3_variant
+        valid_drop_causes = {None, "gripper-release", "friction-loss", "motion-disturbance"}
+        valid_variants = {"normal", "injected-fault", "wrong-cause", "true-fix"}
+        if midway_drop_cause not in valid_drop_causes or midway_drop_variant not in valid_variants:
+            raise ValueError("invalid midway-drop comparison configuration")
+        self.midway_drop_cause = midway_drop_cause
+        self.midway_drop_variant = midway_drop_variant
+        self.midway_drop_active = midway_drop_cause is not None and midway_drop_variant in {
+            "injected-fault",
+            "wrong-cause",
+        }
+        valid_misplacement_causes = {None, "planner-x-offset", "transport-y-bias", "early-release"}
+        if misplacement_cause not in valid_misplacement_causes or misplacement_variant not in valid_variants:
+            raise ValueError("invalid misplacement comparison configuration")
+        self.misplacement_cause = misplacement_cause
+        self.misplacement_variant = misplacement_variant
+        self.misplacement_active = misplacement_cause is not None and misplacement_variant in {
+            "injected-fault",
+            "wrong-cause",
+        }
+        if self.midway_drop_active and self.misplacement_active:
+            raise ValueError("midway-drop and misplacement faults cannot be active together")
+        valid_variants = {"normal", "injected-fault", "wrong-cause", "true-fix"}
+        if fault2_variant not in valid_variants or fault3_variant not in valid_variants:
+            raise ValueError("invalid controlled fault comparison variant")
+        if fault1_variant in {"injected-fault", "wrong-cause"}:
+            self.fault_open_gripper = True
+        self.fault_zero_cube_friction = self.fault_zero_cube_friction or fault2_variant in {
+            "injected-fault",
+            "wrong-cause",
+        }
+        self.fault_high_grasp_approach = self.fault_high_grasp_approach or fault3_variant in {
+            "injected-fault",
+            "wrong-cause",
+        }
         if sum(
             (
                 self.fault_open_gripper,
@@ -80,6 +143,41 @@ class FrankaPickPlace:
         self._min_gripper_finger_sum_during_grasp = float("inf")
         self._grasp_ee_distance_at_command = None
         self._last_observation = None
+        self._midway_fault_triggered = False
+        self._midway_fault_run_step = None
+        self._max_cube_height_before_drop = float("-inf")
+        self._min_cube_height_after_drop = float("inf")
+        self._cube_height_at_drop = None
+        self._cube_ee_distance_at_drop = None
+        self._max_cube_ee_distance_after_drop = float("-inf")
+        self._drop_action = None
+        self._drop_disturbance_velocity_z_mps = None
+        self._finger_cube_collision_filter_before = None
+        self._finger_cube_collision_filter_after = None
+        self._finger_collision_paths = [
+            "/World/robot/panda_hand",
+            "/World/robot/panda_leftfinger",
+            "/World/robot/panda_rightfinger",
+        ]
+        self._finger_cube_collision_filter_active = False
+        self._wrong_diagnosis = None
+        self._wrong_diagnosis_action = None
+        self._misplacement_fault_triggered = False
+        self._misplacement_fault_run_step = None
+        self._placement_action = None
+        self._planned_release_position = None
+        self._commanded_transport_position = None
+        self._misplacement_target_offset_m = np.zeros(3)
+        self._misplacement_transport_bias_m = np.zeros(3)
+        self._early_release_phase_step = 32
+        self._early_release_triggered = False
+        self._early_release_end_effector_position = None
+        self._early_release_cube_position = None
+        self._early_release_distance_to_target_m = None
+        self._misplacement_wrong_diagnosis = None
+        self._misplacement_wrong_diagnosis_action = None
+        self.cube_geom = None
+        self.finger_collision_geoms = None
 
         # Define step counts for each phase
         self.events_dt = events_dt
@@ -125,6 +223,18 @@ class FrankaPickPlace:
 
         cube_ee_distance = float(np.linalg.norm(cube_position - ee_position))
         self._max_cube_height = max(self._max_cube_height, float(cube_position[2]))
+        if not self._midway_fault_triggered:
+            self._max_cube_height_before_drop = max(
+                self._max_cube_height_before_drop, float(cube_position[2])
+            )
+        else:
+            self._min_cube_height_after_drop = min(
+                self._min_cube_height_after_drop, float(cube_position[2])
+            )
+            if self._event == 4:
+                self._max_cube_ee_distance_after_drop = max(
+                    self._max_cube_ee_distance_after_drop, cube_ee_distance
+                )
         if self._event >= 3:
             self._min_cube_ee_distance_during_lift = min(
                 self._min_cube_ee_distance_during_lift, cube_ee_distance
@@ -229,6 +339,7 @@ class FrankaPickPlace:
         )
 
         cube_geom = GeomPrim(paths=cube_shape.paths, apply_collision_apis=True)
+        self.cube_geom = cube_geom
         if self.fault_zero_cube_friction:
             zero_friction_material = RigidBodyMaterial(
                 "/World/PhysicsMaterials/zero_cube_friction",
@@ -238,12 +349,234 @@ class FrankaPickPlace:
             )
             zero_friction_material.set_combine_modes(frictions=["min"])
             cube_geom.apply_physics_materials(zero_friction_material)
+            if self.fault2_variant == "wrong-cause":
+                self._emit(
+                    "FAULT_CONFIGURED name=zero-cube-friction "
+                    "static_friction=0.0 dynamic_friction=0.0 combine=min "
+                    "diagnosis=gripper_command diagnosis_action=repeat_close "
+                    "true_cause_preserved=cube_zero_friction"
+                )
+            else:
+                self._emit(
+                    "FAULT_CONFIGURED name=zero-cube-friction "
+                    "static_friction=0.0 dynamic_friction=0.0 combine=min"
+                )
+        elif self.fault1_variant == "wrong-cause":
+            # Apply a plausible contact diagnosis while preserving the actual
+            # open-gripper command. The treatment cannot make an open gripper
+            # lift the cube, so a remaining failure is attributable to the
+            # unchanged command path rather than the diagnosis.
+            diagnosed_friction_material = RigidBodyMaterial(
+                "/World/PhysicsMaterials/diagnosed_cube_friction",
+                static_frictions=[1.0],
+                dynamic_frictions=[1.0],
+                restitutions=[0.0],
+            )
+            diagnosed_friction_material.set_combine_modes(frictions=["max"])
+            cube_geom.apply_physics_materials(diagnosed_friction_material)
             self._emit(
-                "FAULT_CONFIGURED name=zero-cube-friction "
-                "static_friction=0.0 dynamic_friction=0.0 combine=min"
+                "WRONG_CAUSE_APPLIED suspected=contact_friction action=increase_cube_friction "
+                "static_friction=1.0 dynamic_friction=1.0 combine=max "
+                "true_cause_preserved=gripper_command_open"
             )
         self.cube = RigidPrim(paths=cube_shape.paths)
         cube_shape.apply_visual_materials(visual_material)
+
+    def _trigger_midway_drop(self) -> None:
+        """Apply one mid-transport intervention after the cube was grasped."""
+        if not self.midway_drop_active or self._midway_fault_triggered:
+            return
+
+        self._midway_fault_triggered = True
+        self._midway_fault_run_step = self._run_step_count
+        self._cube_height_at_drop = (
+            None
+            if self._last_observation is None
+            else float(self._last_observation.get("cube_position", [0.0, 0.0, 0.0])[2])
+        )
+        self._cube_ee_distance_at_drop = (
+            None
+            if self._last_observation is None
+            else float(self._last_observation.get("cube_ee_distance"))
+        )
+        cause = self.midway_drop_cause
+        wrong = self.midway_drop_variant == "wrong-cause"
+        if wrong:
+            self._wrong_diagnosis = {
+                "gripper-release": "contact_friction",
+                "friction-loss": "gripper_command",
+                "motion-disturbance": "gripper_command",
+            }[cause]
+            self._wrong_diagnosis_action = {
+                "gripper-release": "increase_cube_friction",
+                "friction-loss": "repeat_close",
+                "motion-disturbance": "verify_close_command",
+            }[cause]
+            self._emit(
+                f"WRONG_CAUSE_APPLIED cause={cause} diagnosis={self._wrong_diagnosis} "
+                f"action={self._wrong_diagnosis_action} "
+                "true_cause_preserved=true"
+            )
+            # These treatments are intentionally ineffective. The real
+            # intervention below remains active in the same simulation step.
+            if self._wrong_diagnosis_action == "repeat_close":
+                self.robot.close_gripper()
+            elif self._wrong_diagnosis_action == "increase_cube_friction":
+                diagnosed_friction_material = RigidBodyMaterial(
+                    "/World/PhysicsMaterials/midway_diagnosed_friction",
+                    static_frictions=[1.0],
+                    dynamic_frictions=[1.0],
+                    restitutions=[0.0],
+                )
+                diagnosed_friction_material.set_combine_modes(frictions=["max"])
+                self.cube_geom.apply_physics_materials(diagnosed_friction_material)
+            else:
+                # Verifying the already-issued close command is diagnostic only.
+                # It must not alter contact physics or the active disturbance.
+                assert self._wrong_diagnosis_action == "verify_close_command"
+
+        if cause == "gripper-release":
+            self._drop_action = "open_gripper_during_transport"
+            self._emit(
+                "FAULT_INJECTED name=midway-gripper-release phase=move_to_target "
+                "action=open_gripper true_cause_preserved=true" if wrong else
+                "FAULT_INJECTED name=midway-gripper-release phase=move_to_target action=open_gripper"
+            )
+            self.robot.open_gripper()
+        elif cause == "friction-loss":
+            self._drop_action = "disable_finger_cube_collision_during_transport"
+            # Filter only cube-versus-gripper collision pairs. Unlike changing
+            # the cube material or state, this leaves gravity, the table, and
+            # robot commands untouched while removing the physical constraint
+            # that carries the cube.
+            stage = omni.usd.get_context().get_stage()
+            cube_prim = stage.GetPrimAtPath("/World/Cube")
+            filtered_pairs = UsdPhysics.FilteredPairsAPI.Apply(cube_prim)
+            relation = filtered_pairs.CreateFilteredPairsRel()
+            for path in self._finger_collision_paths:
+                relation.AddTarget(path)
+            self._finger_cube_collision_filter_before = [False] * len(self._finger_collision_paths)
+            self._finger_cube_collision_filter_after = [True] * len(self._finger_collision_paths)
+            self._finger_cube_collision_filter_active = True
+            before_text = "[false,false,false]"
+            after_text = "[true,true,true]"
+            self._emit(
+                "FAULT_INJECTED name=midway-finger-cube-collision-disabled "
+                "phase=move_to_target finger_collision_paths=panda_hand,panda_leftfinger,panda_rightfinger "
+                "mechanism=UsdPhysics.FilteredPairsAPI "
+                f"collision_filter_before={before_text} "
+                f"collision_filter_after={after_text} "
+                "true_cause_preserved=true"
+                if wrong
+                else "FAULT_INJECTED name=midway-finger-cube-collision-disabled "
+                "phase=move_to_target finger_collision_paths=panda_hand,panda_leftfinger,panda_rightfinger "
+                "mechanism=UsdPhysics.FilteredPairsAPI "
+                f"collision_filter_before={before_text} "
+                f"collision_filter_after={after_text}"
+            )
+        elif cause == "motion-disturbance":
+            self._drop_action = "downward_disturbance_velocity"
+            self._drop_disturbance_velocity_z_mps = -3.0
+            self.cube.set_velocities(
+                linear_velocities=np.array([[0.0, 0.0, self._drop_disturbance_velocity_z_mps]]),
+                angular_velocities=np.zeros((1, 3)),
+            )
+            self._emit(
+                "FAULT_INJECTED name=midway-motion-disturbance phase=move_to_target "
+                "linear_velocity_z_mps=-3.0 true_cause_preserved=true"
+                if wrong
+                else "FAULT_INJECTED name=midway-motion-disturbance phase=move_to_target linear_velocity_z_mps=-3.0"
+            )
+
+    def _configure_misplacement_transport(self) -> None:
+        """Set one placement-only intervention at the transport phase boundary."""
+        target = np.asarray(self.target_position, dtype=float)
+        self._planned_release_position = target.copy()
+        self._commanded_transport_position = target.copy()
+        self._misplacement_target_offset_m = np.zeros(3)
+        self._misplacement_transport_bias_m = np.zeros(3)
+
+        if not self.misplacement_active or self._misplacement_fault_triggered:
+            return
+
+        self._misplacement_fault_triggered = True
+        self._misplacement_fault_run_step = self._run_step_count
+        cause = self.misplacement_cause
+        wrong = self.misplacement_variant == "wrong-cause"
+        if wrong:
+            self._misplacement_wrong_diagnosis = {
+                "planner-x-offset": "gripper_closure",
+                "transport-y-bias": "planner_target_frame",
+                "early-release": "transport_tracking",
+            }[cause]
+            self._misplacement_wrong_diagnosis_action = {
+                "planner-x-offset": "repeat_close_gripper",
+                "transport-y-bias": "reissue_nominal_planner_target",
+                "early-release": "reissue_nominal_transport_target",
+            }[cause]
+            self._emit(
+                f"WRONG_CAUSE_APPLIED cause={cause} diagnosis={self._misplacement_wrong_diagnosis} "
+                f"action={self._misplacement_wrong_diagnosis_action} true_cause_preserved=true"
+            )
+            if self._misplacement_wrong_diagnosis_action == "repeat_close_gripper":
+                self.robot.close_gripper()
+
+        if cause == "planner-x-offset":
+            self._placement_action = "planner_release_target_x_offset"
+            self._misplacement_target_offset_m = np.array([0.16, 0.0, 0.0])
+            self._planned_release_position = target + self._misplacement_target_offset_m
+            self._commanded_transport_position = self._planned_release_position.copy()
+        elif cause == "transport-y-bias":
+            self._placement_action = "transport_controller_y_command_bias"
+            self._misplacement_transport_bias_m = np.array([0.0, 0.16, 0.0])
+            self._commanded_transport_position = target + self._misplacement_transport_bias_m
+        elif cause == "early-release":
+            self._placement_action = "open_gripper_before_target"
+        else:
+            raise RuntimeError(f"unsupported misplacement cause: {cause}")
+
+        self._emit(
+            f"FAULT_INJECTED name=misplacement-{cause} phase=move_to_target "
+            f"action={self._placement_action} planned_release_position_m={self._planned_release_position.tolist()} "
+            f"commanded_transport_position_m={self._commanded_transport_position.tolist()} "
+            f"planner_offset_m={self._misplacement_target_offset_m.tolist()} "
+            f"transport_bias_m={self._misplacement_transport_bias_m.tolist()} "
+            f"early_release_phase_step={self._early_release_phase_step}"
+            + (" true_cause_preserved=true" if wrong else "")
+        )
+
+    def _trigger_early_release(self) -> None:
+        """Open the gripper once at a measured, pre-target transport step."""
+        if self._early_release_triggered or self.misplacement_cause != "early-release":
+            return
+        self._early_release_triggered = True
+        observation = self._last_observation or {}
+        end_effector = observation.get("end_effector_position")
+        cube_position = observation.get("cube_position")
+        self._early_release_end_effector_position = None if end_effector is None else list(end_effector)
+        self._early_release_cube_position = None if cube_position is None else list(cube_position)
+        if end_effector is not None:
+            self._early_release_distance_to_target_m = float(
+                np.linalg.norm(np.asarray(end_effector, dtype=float)[:2] - self.target_position[:2])
+            )
+        self._emit(
+            "FAULT_INJECTED name=misplacement-early-release phase=move_to_target "
+            f"phase_step={self._step} end_effector_position_m={self._early_release_end_effector_position} "
+            f"cube_position_m={self._early_release_cube_position} "
+            f"distance_to_target_xy_m={self._early_release_distance_to_target_m}"
+        )
+        self._phase_history.append(
+            {
+                "event": self._event,
+                "phase": "early_release_fault",
+                "run_step": self._run_step_count,
+                "phase_step": self._step,
+                "end_effector_position_m": self._early_release_end_effector_position,
+                "cube_position_m": self._early_release_cube_position,
+                "distance_to_target_xy_m": self._early_release_distance_to_target_m,
+            }
+        )
+        self.robot.open_gripper()
 
     def forward(self, ik_method: str = "damped-least-squares") -> bool:
         """Execute one step of the pick-and-place operation using the specified IK method.
@@ -326,7 +659,18 @@ class FrankaPickPlace:
         elif self._event == 2:
             if self._step == 0:
                 grasp_command = "open" if self.fault_open_gripper else "close"
-                if self.fault_open_gripper:
+                if self.fault1_variant == "wrong-cause":
+                    self._emit(
+                        "FAULT_INJECTED name=open-gripper-during-grasp command=open_gripper "
+                        "diagnosis=contact_friction diagnosis_action=increase_cube_friction"
+                    )
+                elif self.fault2_variant == "wrong-cause":
+                    self._emit(
+                        "FAULT_INJECTED name=zero-cube-friction command=close_gripper "
+                        "diagnosis=gripper_command diagnosis_action=repeat_close "
+                        "true_cause_preserved=cube_zero_friction"
+                    )
+                elif self.fault_open_gripper:
                     self._emit("FAULT_INJECTED name=open-gripper-during-grasp command=open_gripper")
                 elif self.fault_zero_cube_friction:
                     self._emit(
@@ -334,10 +678,18 @@ class FrankaPickPlace:
                         "command=close_gripper static_friction=0.0 dynamic_friction=0.0 combine=min"
                     )
                 elif self.fault_high_grasp_approach:
-                    self._emit(
-                        "FAULT_INJECTED name=high-grasp-approach "
-                        "command=close_gripper height_offset_m=0.08 contact=default"
-                    )
+                    if self.fault3_variant == "wrong-cause":
+                        self._emit(
+                            "FAULT_INJECTED name=high-grasp-approach command=close_gripper "
+                            "diagnosis=height_reference_calibration "
+                            "diagnosis_action=verify_cube_top_height "
+                            "height_offset_m=0.08 true_cause_preserved=approach_geometry"
+                        )
+                    else:
+                        self._emit(
+                            "FAULT_INJECTED name=high-grasp-approach "
+                            "command=close_gripper height_offset_m=0.08 contact=default"
+                        )
                 self._grasp_ee_distance_at_command = (
                     None
                     if self._last_observation is None
@@ -351,13 +703,50 @@ class FrankaPickPlace:
                         "run_step": self._run_step_count,
                         "grasp_command": grasp_command,
                         "contact_condition": (
-                            "zero_cube_friction" if self.fault_zero_cube_friction else "default"
+                            "zero_cube_friction"
+                            if self.fault_zero_cube_friction
+                            else (
+                                "increased_cube_friction"
+                                if self.fault1_variant == "wrong-cause"
+                                else "default"
+                            )
                         ),
                         "approach_condition": (
                             "high_grasp_approach" if self.fault_high_grasp_approach else "default"
                         ),
+                        "fault2_contact_condition": (
+                            "zero_cube_friction"
+                            if self.fault_zero_cube_friction
+                            else "default"
+                        ),
+                        "fault3_approach_condition": (
+                            "high_grasp_approach"
+                            if self.fault_high_grasp_approach
+                            else "default"
+                        ),
+                        "wrong_diagnosis": (
+                            "height_reference_calibration"
+                            if self.fault3_variant == "wrong-cause"
+                            else None
+                        ),
+                        "wrong_diagnosis_action": (
+                            "verify_cube_top_height"
+                            if self.fault3_variant == "wrong-cause"
+                            else None
+                        ),
                         "grasp_height_offset_m": self.grasp_height_offset_m,
                         "grasp_ee_distance_at_command_m": self._grasp_ee_distance_at_command,
+                        "fault1_variant": self.fault1_variant,
+                        "fault2_variant": self.fault2_variant,
+                        "fault3_variant": self.fault3_variant,
+                        "true_cause_preserved": any(
+                            variant == "wrong-cause"
+                            for variant in (self.fault1_variant, self.fault2_variant, self.fault3_variant)
+                        ),
+                        "true_cause_modified": any(
+                            variant == "true-fix"
+                            for variant in (self.fault1_variant, self.fault2_variant, self.fault3_variant)
+                        ),
                     }
                 )
 
@@ -365,6 +754,11 @@ class FrankaPickPlace:
                 self.robot.open_gripper()
             else:
                 self.robot.close_gripper()
+                if self.fault2_variant == "wrong-cause":
+                    # The diagnosed command path is deliberately ineffective;
+                    # repeat the normal close command while retaining the real
+                    # zero-friction cause.
+                    self.robot.close_gripper()
 
             self._step += 1
             if self._step >= self.events_dt[2]:
@@ -400,17 +794,66 @@ class FrankaPickPlace:
         elif self._event == 4:
             if self._step == 0:
                 self._emit("Phase 4: Moving cube...")
+                if self.midway_drop_active:
+                    self._trigger_midway_drop()
+                self._configure_misplacement_transport()
                 self._phase_history.append(
                     {
                         "event": self._event,
                         "phase": self.phase_name,
                         "run_step": self._run_step_count,
+                        "midway_drop_cause": self.midway_drop_cause,
+                        "midway_drop_variant": self.midway_drop_variant,
+                        "drop_triggered": self._midway_fault_triggered,
+                        "drop_action": self._drop_action,
+                        "drop_disturbance_velocity_z_mps": self._drop_disturbance_velocity_z_mps,
+                        "true_cause_preserved": self.midway_drop_variant == "wrong-cause",
+                        "true_cause_modified": self.midway_drop_variant == "true-fix",
+                        "wrong_diagnosis": self._wrong_diagnosis,
+                        "wrong_diagnosis_action": self._wrong_diagnosis_action,
+                        "cube_height_at_drop_m": self._cube_height_at_drop,
+                        "finger_cube_collision_filter_before": self._finger_cube_collision_filter_before,
+                        "finger_cube_collision_filter_after": self._finger_cube_collision_filter_after,
+                        "finger_cube_collision_filter_targets": self._finger_collision_paths,
+                        "max_cube_height_before_drop_m": (
+                            None
+                            if not np.isfinite(self._max_cube_height_before_drop)
+                            else float(self._max_cube_height_before_drop)
+                        ),
+                        "misplacement_cause": self.misplacement_cause,
+                        "misplacement_variant": self.misplacement_variant,
+                        "misplacement_triggered": self._misplacement_fault_triggered,
+                        "placement_action": self._placement_action,
+                        "planned_release_position_m": (
+                            None if self._planned_release_position is None else self._planned_release_position.tolist()
+                        ),
+                        "commanded_transport_position_m": (
+                            None
+                            if self._commanded_transport_position is None
+                            else self._commanded_transport_position.tolist()
+                        ),
+                        "planner_offset_m": self._misplacement_target_offset_m.tolist(),
+                        "transport_command_bias_m": self._misplacement_transport_bias_m.tolist(),
+                        "early_release_phase_step": self._early_release_phase_step,
+                        "misplacement_wrong_diagnosis": self._misplacement_wrong_diagnosis,
+                        "misplacement_wrong_diagnosis_action": self._misplacement_wrong_diagnosis_action,
+                        "misplacement_true_cause_preserved": self.misplacement_variant == "wrong-cause",
+                        "misplacement_true_cause_modified": self.misplacement_variant == "true-fix",
                     }
                 )
 
+            if self._midway_fault_triggered and self.midway_drop_cause == "gripper-release":
+                self.robot.open_gripper()
+            if (
+                self._misplacement_fault_triggered
+                and self.misplacement_cause == "early-release"
+                and self._step >= self._early_release_phase_step
+            ):
+                self._trigger_early_release()
+
             # Move to position using the controller
             self.robot.set_end_effector_pose(
-                position=self.target_position, orientation=goal_orientation, ik_method=ik_method
+                position=self._commanded_transport_position, orientation=goal_orientation, ik_method=ik_method
             )
 
             self._step += 1
@@ -500,6 +943,33 @@ class FrankaPickPlace:
         self._min_gripper_finger_sum_during_grasp = float("inf")
         self._grasp_ee_distance_at_command = None
         self._last_observation = None
+        self._midway_fault_triggered = False
+        self._midway_fault_run_step = None
+        self._max_cube_height_before_drop = float("-inf")
+        self._min_cube_height_after_drop = float("inf")
+        self._cube_height_at_drop = None
+        self._cube_ee_distance_at_drop = None
+        self._max_cube_ee_distance_after_drop = float("-inf")
+        self._drop_action = None
+        self._drop_disturbance_velocity_z_mps = None
+        self._finger_cube_collision_filter_before = None
+        self._finger_cube_collision_filter_after = None
+        self._finger_cube_collision_filter_active = False
+        self._wrong_diagnosis = None
+        self._wrong_diagnosis_action = None
+        self._misplacement_fault_triggered = False
+        self._misplacement_fault_run_step = None
+        self._placement_action = None
+        self._planned_release_position = None
+        self._commanded_transport_position = None
+        self._misplacement_target_offset_m = np.zeros(3)
+        self._misplacement_transport_bias_m = np.zeros(3)
+        self._early_release_triggered = False
+        self._early_release_end_effector_position = None
+        self._early_release_cube_position = None
+        self._early_release_distance_to_target_m = None
+        self._misplacement_wrong_diagnosis = None
+        self._misplacement_wrong_diagnosis_action = None
         self._emit("Pick-and-place system reset complete")
 
     def reset_robot(self):
@@ -572,11 +1042,60 @@ class FrankaPickPlace:
         final_xy_error = float(np.linalg.norm(final_position[:2] - target_position[:2]))
         final_z_error = float(abs(final_position[2] - tabletop_position[2]))
         max_lift = float(self._max_cube_height - self._run_start_cube_position[2])
+        pre_drop_height = (
+            self._max_cube_height_before_drop
+            if np.isfinite(self._max_cube_height_before_drop)
+            else self._max_cube_height
+        )
+        pre_drop_lift = float(pre_drop_height - self._run_start_cube_position[2])
+        post_drop_min_height = (
+            None
+            if not np.isfinite(self._min_cube_height_after_drop)
+            else float(self._min_cube_height_after_drop)
+        )
+        drop_distance = (
+            None
+            if post_drop_min_height is None
+            else float(pre_drop_height - post_drop_min_height)
+        )
+        post_drop_max_separation = (
+            None
+            if not np.isfinite(self._max_cube_ee_distance_after_drop)
+            else float(self._max_cube_ee_distance_after_drop)
+        )
+        separation_increase = (
+            None
+            if self._cube_ee_distance_at_drop is None or post_drop_max_separation is None
+            else float(post_drop_max_separation - self._cube_ee_distance_at_drop)
+        )
+        grasp_established_before_fault = pre_drop_lift >= 0.05
+        drop_detected = bool(
+            self._midway_fault_triggered
+            and grasp_established_before_fault
+            and drop_distance is not None
+            and drop_distance >= 0.05
+            and separation_increase is not None
+            and separation_increase >= 0.08
+        )
 
         lifted = max_lift >= 0.05
         placed_xy = final_xy_error <= xy_tolerance
         placed_on_table = final_z_error <= z_tolerance
-        success = bool(self.is_done() and lifted and placed_xy and placed_on_table)
+        misplacement_detected = bool(
+            self._misplacement_fault_triggered and lifted and final_xy_error > xy_tolerance
+        )
+        # A mid-transport drop is a task failure even when the cube later
+        # happens to settle inside the target tolerances.  Treat the physical
+        # event as authoritative so the comparison cannot call a dropped run
+        # successful merely because its final pose looks acceptable.
+        success = bool(
+            self.is_done()
+            and lifted
+            and placed_xy
+            and placed_on_table
+            and not drop_detected
+            and not misplacement_detected
+        )
 
         reasons = []
         if not self.is_done():
@@ -587,6 +1106,10 @@ class FrankaPickPlace:
             reasons.append("final_xy_out_of_tolerance")
         if not placed_on_table:
             reasons.append("final_z_out_of_tolerance")
+        if drop_detected:
+            reasons.append("midway_drop_detected")
+        if misplacement_detected:
+            reasons.append("misplacement_detected")
 
         return {
             "success": success,
@@ -599,10 +1122,53 @@ class FrankaPickPlace:
             "target_position": target_position.tolist(),
             "expected_tabletop_position": tabletop_position.tolist(),
             "final_cube_position": final_position.tolist(),
+            "final_xy_error_vector_m": (final_position[:2] - target_position[:2]).tolist(),
             "final_xy_error_m": final_xy_error,
             "final_z_error_m": final_z_error,
             "max_cube_height_m": float(self._max_cube_height),
             "max_lift_m": max_lift,
+            "midway_drop_cause": self.midway_drop_cause,
+            "midway_drop_variant": self.midway_drop_variant,
+            "midway_fault_triggered": self._midway_fault_triggered,
+            "midway_fault_run_step": self._midway_fault_run_step,
+            "drop_action": self._drop_action,
+            "drop_disturbance_velocity_z_mps": self._drop_disturbance_velocity_z_mps,
+            "finger_cube_collision_filter_before": self._finger_cube_collision_filter_before,
+            "finger_cube_collision_filter_after": self._finger_cube_collision_filter_after,
+            "finger_cube_collision_filter_targets": self._finger_collision_paths,
+            "cube_height_at_drop_m": self._cube_height_at_drop,
+            "cube_ee_distance_at_drop_m": self._cube_ee_distance_at_drop,
+            "max_cube_height_before_drop_m": float(pre_drop_height),
+            "pre_drop_lift_m": pre_drop_lift,
+            "min_cube_height_after_drop_m": post_drop_min_height,
+            "drop_distance_m": drop_distance,
+            "max_cube_ee_distance_after_drop_m": post_drop_max_separation,
+            "drop_separation_increase_m": separation_increase,
+            "grasp_established_before_fault": grasp_established_before_fault,
+            "drop_detected": drop_detected,
+            "midway_wrong_diagnosis": self._wrong_diagnosis,
+            "midway_wrong_diagnosis_action": self._wrong_diagnosis_action,
+            "misplacement_cause": self.misplacement_cause,
+            "misplacement_variant": self.misplacement_variant,
+            "misplacement_fault_triggered": self._misplacement_fault_triggered,
+            "misplacement_fault_run_step": self._misplacement_fault_run_step,
+            "misplacement_detected": misplacement_detected,
+            "placement_action": self._placement_action,
+            "planned_release_position_m": (
+                None if self._planned_release_position is None else self._planned_release_position.tolist()
+            ),
+            "commanded_transport_position_m": (
+                None if self._commanded_transport_position is None else self._commanded_transport_position.tolist()
+            ),
+            "planner_offset_m": self._misplacement_target_offset_m.tolist(),
+            "transport_command_bias_m": self._misplacement_transport_bias_m.tolist(),
+            "early_release_phase_step": self._early_release_phase_step,
+            "early_release_triggered": self._early_release_triggered,
+            "early_release_end_effector_position_m": self._early_release_end_effector_position,
+            "early_release_cube_position_m": self._early_release_cube_position,
+            "early_release_distance_to_target_xy_m": self._early_release_distance_to_target_m,
+            "misplacement_wrong_diagnosis": self._misplacement_wrong_diagnosis,
+            "misplacement_wrong_diagnosis_action": self._misplacement_wrong_diagnosis_action,
             "min_cube_ee_distance_during_lift_m": (
                 None
                 if not np.isfinite(self._min_cube_ee_distance_during_lift)
